@@ -1,0 +1,611 @@
+package detect
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Capabilities represents the full hardware and environment profile.
+type Capabilities struct {
+	OS       string    `json:"os"`
+	Arch     string    `json:"arch"`
+	GPUs     []GPU     `json:"gpus"`
+	RAM      RAMInfo   `json:"ram"`
+	CPU      CPUInfo   `json:"cpu"`
+	Backends []Backend `json:"backends"`
+}
+
+// GPU represents a single GPU device.
+type GPU struct {
+	Index           int    `json:"index"`
+	Name            string `json:"name"`
+	VRAMTotalMB     int    `json:"vram_total_mb"`
+	VRAMUsedMB      int    `json:"vram_used_mb,omitempty"`
+	Driver          string `json:"driver,omitempty"`
+	PCIGen          int    `json:"pci_gen,omitempty"`
+	PCILanes        int    `json:"pci_lanes,omitempty"`
+	BandwidthMBps   int    `json:"bandwidth_mbps,omitempty"`
+	BandwidthSource string `json:"bandwidth_source,omitempty"`
+	PCIBusID        string `json:"pci_bus_id,omitempty"`
+	ComputeCap      string `json:"compute_cap,omitempty"`
+}
+
+// RAMInfo represents system memory.
+type RAMInfo struct {
+	TotalMB int `json:"total_mb"`
+	FreeMB  int `json:"free_mb"`
+}
+
+// CPUInfo represents CPU details.
+type CPUInfo struct {
+	Model   string `json:"model"`
+	Cores   int    `json:"cores"`
+	Threads int    `json:"threads"`
+	Flags   string `json:"flags,omitempty"`
+}
+
+// Backend represents a discovered inference backend binary.
+type Backend struct {
+	Name    string `json:"name"`
+	Path    string `json:"path"`
+	Version string `json:"version,omitempty"`
+}
+
+// Detect probes the system and returns capabilities.
+func Detect() (*Capabilities, error) {
+	gpus := detectNVIDIA()
+	if len(gpus) == 0 {
+		gpus = detectVulkanGPUs()
+	}
+	if len(gpus) == 0 {
+		gpus = detectAppleSilicon()
+	}
+	settleGPUFreeVRAM(gpus)
+
+	ram := detectRAM()
+	cpu := detectCPU()
+	backends := detectBackends()
+
+	return &Capabilities{
+		OS:       runtime.GOOS,
+		Arch:     runtime.GOARCH,
+		GPUs:     gpus,
+		RAM:      ram,
+		CPU:      cpu,
+		Backends: backends,
+	}, nil
+}
+
+func detectNVIDIA() []GPU {
+	out, err := exec.Command("nvidia-smi",
+		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,driver_version,compute_cap",
+		"--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return nil
+	}
+	// Query PCIe bandwidth separately. Link speed often idles down to Gen1 when
+	// the GPU is not busy, so current gen is not a stable performance signal.
+	// Lane width is different: on mixed-slot/riser systems a GPU can be physically
+	// limited to x1/x4 even though the card's advertised max width is x16. Use
+	// max gen with observed current width when current width is lower than max;
+	// otherwise keep max gen/width. Non-NVIDIA and unknown platforms leave
+	// bandwidth empty, and placement falls back to neutral free-VRAM weighting.
+	pcieOut, _ := exec.Command("nvidia-smi",
+		"--query-gpu=pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max",
+		"--format=csv,noheader,nounits").Output()
+	pcieLinks := parseNVIDIAPCIeLinks(string(pcieOut))
+
+	var gpus []GPU
+	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := strings.Split(line, ", ")
+		if len(parts) < 6 {
+			continue
+		}
+		idx, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
+		pciBusID := strings.TrimSpace(parts[1])
+		vramTotal, _ := strconv.Atoi(strings.TrimSpace(parts[3]))
+		vramUsed, _ := strconv.Atoi(strings.TrimSpace(parts[4]))
+		driver := ""
+		if len(parts) >= 6 {
+			driver = strings.TrimSpace(parts[5])
+		}
+		computeCap := ""
+		if len(parts) >= 7 {
+			computeCap = strings.TrimSpace(parts[6])
+		}
+		gpu := GPU{
+			Index:       idx,
+			Name:        strings.TrimSpace(parts[2]),
+			VRAMTotalMB: vramTotal,
+			VRAMUsedMB:  vramUsed,
+			Driver:      driver,
+			PCIBusID:    pciBusID,
+			ComputeCap:  computeCap,
+		}
+		// Parse PCIe bandwidth.
+		if i < len(pcieLinks) {
+			applyNVIDIAPCIeLink(&gpu, pcieLinks[i])
+		}
+		// Fallback: if nvidia-smi returned no usable PCIe data, try sysfs.
+		if gpu.BandwidthMBps <= 0 && gpu.PCIBusID != "" {
+			gpu.BandwidthMBps = pcieBandwidthFromSysfs(gpu.PCIBusID)
+			if gpu.BandwidthMBps > 0 {
+				gpu.BandwidthSource = "sysfs_max"
+			}
+		}
+		gpus = append(gpus, gpu)
+	}
+
+	// Sort GPUs by PCI bus ID ascending to match CUDA_DEVICE_ORDER=PCI_BUS_ID.
+	// The Go server sets this env var when launching llama-server, so CUDA
+	// assigns device 0 to the lowest PCI bus ID. Re-index 0..N-1.
+	sort.Slice(gpus, func(i, j int) bool {
+		return gpus[i].PCIBusID < gpus[j].PCIBusID
+	})
+	for i := range gpus {
+		gpus[i].Index = i
+	}
+
+	return gpus
+}
+
+// settleGPUFreeVRAM guards against a race where a just-killed process's VRAM
+// hasn't finished being reclaimed by the driver at the moment ggrun samples
+// it. Placement made on that stale reading can wrongly exclude a GPU that is
+// actually free, dumping the whole model onto a different GPU and system RAM
+// instead — reproduced 2026-07-08 twice (tensor-split 0.00,0.00,1.00 and
+// 0.00,1.00,0.00) immediately after killing a prior server. Idle GPUs
+// (already near zero) skip the check entirely — the race only matters when
+// there's real reported usage that might actually be stale. Bounded to a few
+// hundred ms in the common (already-stable) case, up to ~1.6s worst case.
+func settleGPUFreeVRAM(gpus []GPU) {
+	if !anyMeaningfulUsage(gpus) {
+		return
+	}
+	const maxAttempts = 4
+	const settleDelay = 400 * time.Millisecond
+	prev := busIDUsageMap(gpus)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		time.Sleep(settleDelay)
+		cur := queryNVIDIAMemoryUsedMB()
+		if cur == nil {
+			return // nvidia-smi unavailable this round; keep the original reading
+		}
+		if applySettleRound(gpus, prev, cur, settleStableThresholdMB) {
+			return
+		}
+	}
+}
+
+const settleStableThresholdMB = 64
+
+// anyMeaningfulUsage reports whether any GPU shows non-trivial VRAM use. An
+// idle machine (all near zero) can never be mid-teardown, so it skips the
+// settle delay entirely — the race only matters when there's real reported
+// usage that might actually be stale.
+func anyMeaningfulUsage(gpus []GPU) bool {
+	for _, g := range gpus {
+		if g.VRAMUsedMB > settleStableThresholdMB {
+			return true
+		}
+	}
+	return false
+}
+
+// busIDUsageMap snapshots each GPU's VRAMUsedMB keyed by PCI bus ID — the one
+// identifier stable across nvidia-smi's own (un-resorted) enumeration and
+// detectNVIDIA's PCI-bus-ID-sorted GPU list. Using Index instead would
+// silently compare the wrong devices on any box where those two orderings
+// differ (true on this box: PCIe positions don't match nvidia-smi's default
+// CUDA enumeration).
+func busIDUsageMap(gpus []GPU) map[string]int {
+	m := make(map[string]int, len(gpus))
+	for _, g := range gpus {
+		if g.PCIBusID != "" {
+			m[g.PCIBusID] = g.VRAMUsedMB
+		}
+	}
+	return m
+}
+
+// applySettleRound merges one fresh nvidia-smi reading into gpus and prev
+// (both updated in place, keyed by PCI bus ID) and reports whether every GPU's
+// reading moved by no more than thresholdMB since the previous round —
+// "stopped changing" is the signal that any post-kill VRAM reclaim has
+// finished and the reading can be trusted for placement.
+func applySettleRound(gpus []GPU, prev map[string]int, cur map[string]int, thresholdMB int) bool {
+	stable := true
+	for i := range gpus {
+		if gpus[i].PCIBusID == "" {
+			continue
+		}
+		u, ok := cur[gpus[i].PCIBusID]
+		if !ok {
+			continue
+		}
+		delta := u - prev[gpus[i].PCIBusID]
+		if delta < 0 {
+			delta = -delta
+		}
+		if delta > thresholdMB {
+			stable = false
+		}
+		prev[gpus[i].PCIBusID] = u
+		gpus[i].VRAMUsedMB = u
+	}
+	return stable
+}
+
+// queryNVIDIAMemoryUsedMB re-samples just memory.used, keyed by PCI bus ID.
+// Returns nil on any failure so the caller falls back to whatever it already
+// had rather than zeroing GPUs out.
+func queryNVIDIAMemoryUsedMB() map[string]int {
+	out, err := exec.Command("nvidia-smi",
+		"--query-gpu=pci.bus_id,memory.used",
+		"--format=csv,noheader,nounits").Output()
+	if err != nil {
+		return nil
+	}
+	return parseNVIDIAMemoryUsedMB(string(out))
+}
+
+// parseNVIDIAMemoryUsedMB parses `nvidia-smi --query-gpu=pci.bus_id,memory.used
+// --format=csv,noheader,nounits` output. Split out from queryNVIDIAMemoryUsedMB
+// so the parsing logic is testable without shelling out to nvidia-smi.
+func parseNVIDIAMemoryUsedMB(out string) map[string]int {
+	result := make(map[string]int)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		parts := strings.Split(line, ", ")
+		if len(parts) < 2 {
+			continue
+		}
+		busID := strings.TrimSpace(parts[0])
+		used, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil || busID == "" {
+			continue
+		}
+		result[busID] = used
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+type nvidiaPCIeLink struct {
+	currentGen   int
+	currentWidth int
+	maxGen       int
+	maxWidth     int
+}
+
+func parseNVIDIAPCIeLinks(out string) []nvidiaPCIeLink {
+	var links []nvidiaPCIeLink
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.Split(line, ",")
+		if len(parts) < 4 {
+			continue
+		}
+		links = append(links, nvidiaPCIeLink{
+			currentGen:   parsePositiveInt(parts[0]),
+			currentWidth: parsePositiveInt(parts[1]),
+			maxGen:       parsePositiveInt(parts[2]),
+			maxWidth:     parsePositiveInt(parts[3]),
+		})
+	}
+	return links
+}
+
+func parsePositiveInt(s string) int {
+	v, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || v <= 0 {
+		return 0
+	}
+	return v
+}
+
+func applyNVIDIAPCIeLink(gpu *GPU, link nvidiaPCIeLink) {
+	if gpu == nil {
+		return
+	}
+	gen, lanes, source := 0, 0, ""
+	if link.maxGen > 0 && link.currentWidth > 0 && link.maxWidth > 0 && link.currentWidth < link.maxWidth {
+		gen = link.maxGen
+		lanes = link.currentWidth
+		source = "observed_width"
+	} else if link.maxGen > 0 && link.maxWidth > 0 {
+		gen = link.maxGen
+		lanes = link.maxWidth
+		source = "max"
+	} else if link.currentGen > 0 && link.currentWidth > 0 {
+		gen = link.currentGen
+		lanes = link.currentWidth
+		source = "current"
+	}
+	if gen <= 0 || lanes <= 0 {
+		return
+	}
+	gpu.PCIGen = gen
+	gpu.PCILanes = lanes
+	gpu.BandwidthMBps = pcieBandwidth(gen, lanes)
+	gpu.BandwidthSource = source
+}
+
+// parseComputeCap parses "8.9" → 809, "8.6" → 806 for comparison.
+func parseComputeCap(cc string) int {
+	parts := strings.SplitN(cc, ".", 2)
+	if len(parts) != 2 {
+		return 0
+	}
+	major, _ := strconv.Atoi(parts[0])
+	minor, _ := strconv.Atoi(parts[1])
+	return major*100 + minor
+}
+
+// pcieBandwidth computes PCIe bandwidth in MB/s from generation and lane count.
+func pcieBandwidth(gen, lanes int) int {
+	// Per-lane bandwidth in MB/s (unidirectional)
+	perLane := map[int]int{
+		1: 250,
+		2: 500,
+		3: 985,  // ~984.6 MB/s
+		4: 1969, // ~1969.0 MB/s
+		5: 3938, // ~3938.0 MB/s
+	}
+	bw, ok := perLane[gen]
+	if !ok {
+		bw = 985 // default to gen3
+	}
+	return bw * lanes
+}
+
+// pcieBandwidthFromSysfs tries to read max PCIe link from sysfs.
+// Used as fallback when nvidia-smi returns 0 (GPU under load).
+func pcieBandwidthFromSysfs(busID string) int {
+	if busID == "" {
+		return 0
+	}
+	// busID is like "00000000:01:00.0"
+	// sysfs path: /sys/bus/pci/devices/0000:01:00.0/
+	dev := strings.TrimPrefix(busID, "0000")
+	if dev == busID {
+		dev = busID
+	}
+	sysPath := "/sys/bus/pci/devices/0000" + dev
+
+	// Read max link speed (1=2.5GT/s, 2=5GT/s, 3=8GT/s, 4=16GT/s)
+	speedBytes, err := os.ReadFile(sysPath + "/max_link_speed")
+	if err != nil {
+		return 0
+	}
+	speedStr := strings.TrimSpace(string(speedBytes))
+	// Format: "8.0 GT/s PCIe" or just "8"
+	speedStr = strings.TrimSuffix(speedStr, " GT/s")
+	speedStr = strings.TrimSuffix(speedStr, " GT/s PCIe")
+	speedStr = strings.TrimSpace(speedStr)
+	speed, _ := strconv.ParseFloat(speedStr, 64)
+	gen := int(speed / 2.5) // 2.5GT/s = Gen1, 5=Gen2, 8=Gen3, 16=Gen4
+
+	// Read max link width
+	widthBytes, err := os.ReadFile(sysPath + "/max_link_width")
+	if err != nil {
+		return 0
+	}
+	widthStr := strings.TrimSpace(string(widthBytes))
+	lanes, _ := strconv.Atoi(widthStr)
+
+	return pcieBandwidth(gen, lanes)
+}
+
+// detectAppleSilicon synthesizes a GPU entry for Apple Silicon unified memory.
+// There is no nvidia-smi/vulkaninfo equivalent on macOS, so without this a Mac
+// reports zero GPUs, placement picks CPUOnly, and the Metal backend is never
+// engaged (-ngl 0). llama.cpp's Metal backend can address roughly 75% of
+// unified memory (Metal's default recommendedMaxWorkingSetSize).
+func detectAppleSilicon() []GPU {
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		return nil
+	}
+	out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+	if err != nil {
+		return nil
+	}
+	memBytes, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	name := "Apple Silicon"
+	if out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output(); err == nil {
+		if s := strings.TrimSpace(string(out)); s != "" {
+			name = s
+		}
+	}
+	gpu, ok := appleSiliconGPU(memBytes, name)
+	if !ok {
+		return nil
+	}
+	return []GPU{gpu}
+}
+
+// appleSiliconGPU builds the unified-memory GPU entry. Split out from
+// detectAppleSilicon so the sizing rule is unit-testable off-macOS.
+func appleSiliconGPU(memBytes int64, name string) (GPU, bool) {
+	if memBytes <= 0 {
+		return GPU{}, false
+	}
+	return GPU{
+		Index:       0,
+		Name:        name,
+		VRAMTotalMB: int(memBytes / 1024 / 1024 * 3 / 4),
+	}, true
+}
+
+func detectRAM() RAMInfo {
+	switch runtime.GOOS {
+	case "linux":
+		return detectRAMLinux()
+	case "darwin":
+		return detectRAMDarwin()
+	case "windows":
+		return detectRAMWindows()
+	default:
+		return RAMInfo{}
+	}
+}
+
+func detectRAMLinux() RAMInfo {
+	freeMB := detectRAMFreeMB()
+	totalMB := freeMB
+	// Try to get total from /proc/meminfo on Linux
+	if runtime.GOOS == "linux" {
+		data, _ := os.ReadFile("/proc/meminfo")
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "MemTotal:") {
+				var kb int
+				fmt.Sscanf(line, "MemTotal: %d kB", &kb)
+				totalMB = kb / 1024
+				break
+			}
+		}
+	}
+	return RAMInfo{TotalMB: totalMB, FreeMB: freeMB}
+}
+
+func detectRAMDarwin() RAMInfo {
+	out, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
+	if err != nil {
+		return RAMInfo{}
+	}
+	bytes, _ := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	totalMB := int(bytes / 1024 / 1024)
+	freeMB := detectRAMFreeMB()
+	if freeMB <= 0 {
+		freeMB = totalMB * 80 / 100
+	}
+	return RAMInfo{TotalMB: totalMB, FreeMB: freeMB}
+}
+
+func detectCPU() CPUInfo {
+	threads := runtime.NumCPU()
+	cores := detectPhysicalCores()
+	model := "unknown"
+	flags := ""
+
+	if runtime.GOOS == "linux" {
+		data, _ := os.ReadFile("/proc/cpuinfo")
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "model name") {
+				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+					model = strings.TrimSpace(parts[1])
+				}
+			}
+			if strings.HasPrefix(line, "flags") {
+				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+					flags = strings.TrimSpace(parts[1])
+				}
+			}
+		}
+	} else if runtime.GOOS == "darwin" {
+		out, _ := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output()
+		model = strings.TrimSpace(string(out))
+	}
+
+	return CPUInfo{
+		Model:   model,
+		Cores:   cores,
+		Threads: threads,
+		Flags:   flags,
+	}
+}
+
+func detectBackends() []Backend {
+	var backends []Backend
+	for _, name := range []string{"llama-server", "ik_llama", "ik_llama-server"} {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			continue
+		}
+		backends = append(backends, Backend{Name: name, Path: path})
+	}
+	return backends
+}
+
+// VRAMFreeMB returns free VRAM for this GPU.
+func (g GPU) VRAMFreeMB() int {
+	free := g.VRAMTotalMB - g.VRAMUsedMB
+	if free < 0 {
+		return 0
+	}
+	return free
+}
+
+// ApplyVRAMHeadroom returns a copy of caps with headroomMB of total VRAM held
+// back, distributed across GPUs in proportion to their size, so the recommender
+// and placement leave a hardware safety margin. headroomMB <= 0 is a no-op.
+func ApplyVRAMHeadroom(caps *Capabilities, headroomMB int) *Capabilities {
+	if caps == nil || headroomMB <= 0 || len(caps.GPUs) == 0 {
+		return caps
+	}
+	total := caps.TotalVRAM()
+	if total <= 0 {
+		return caps
+	}
+	out := *caps
+	out.GPUs = make([]GPU, len(caps.GPUs))
+	copy(out.GPUs, caps.GPUs)
+	for i := range out.GPUs {
+		share := headroomMB * out.GPUs[i].VRAMTotalMB / total
+		if share > out.GPUs[i].VRAMTotalMB {
+			share = out.GPUs[i].VRAMTotalMB
+		}
+		out.GPUs[i].VRAMTotalMB -= share
+	}
+	return &out
+}
+
+// ApplyRAMHeadroom returns a copy of caps with headroomMB of system RAM held
+// back (total and free), so the recommender and placement leave RAM free for
+// the rest of the system. headroomMB <= 0 is a no-op.
+func ApplyRAMHeadroom(caps *Capabilities, headroomMB int) *Capabilities {
+	if caps == nil || headroomMB <= 0 {
+		return caps
+	}
+	out := *caps
+	if out.RAM.TotalMB -= headroomMB; out.RAM.TotalMB < 0 {
+		out.RAM.TotalMB = 0
+	}
+	if out.RAM.FreeMB -= headroomMB; out.RAM.FreeMB < 0 {
+		out.RAM.FreeMB = 0
+	}
+	return &out
+}
+
+// TotalVRAM returns the sum of total VRAM across all detected GPUs.
+func (c *Capabilities) TotalVRAM() int {
+	total := 0
+	for _, g := range c.GPUs {
+		total += g.VRAMTotalMB
+	}
+	return total
+}
+
+// TotalVRAMFree returns the sum of free VRAM across all detected GPUs.
+func (c *Capabilities) TotalVRAMFree() int {
+	total := 0
+	for _, g := range c.GPUs {
+		total += g.VRAMFreeMB()
+	}
+	return total
+}
+
+// JSON returns a pretty-printed JSON representation.
+func (c *Capabilities) JSON() ([]byte, error) {
+	return json.MarshalIndent(c, "", "  ")
+}

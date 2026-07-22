@@ -1,0 +1,1831 @@
+package placement
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/raketenkater/ggrun/pkg/gguf"
+)
+
+// DraftType selects the speculative decoding strategy.
+type DraftType string
+
+const (
+	DraftNone   DraftType = "none"
+	DraftModel  DraftType = "draft_model"
+	DraftEagle3 DraftType = "eagle3"
+	DraftDFlash DraftType = "dflash"
+	DraftNgram  DraftType = "ngram"
+	DraftMTP    DraftType = "mtp"
+
+	// Qwen's official serving recipe uses two speculative tokens, and the
+	// merged llama.cpp MTP benchmarks show that useful ceilings are small
+	// (normally 2-3). Reusing the generic draft-model ceiling of 16 causes the
+	// one-layer MTP head to run repeatedly, collapsing acceptance and throughput.
+	defaultMTPDraftMax = 2
+)
+
+// DraftConfig holds computed speculative decoding parameters.
+// All values are calculated from hardware + model metadata — nothing is guessed.
+type DraftConfig struct {
+	Type             DraftType `json:"type"`
+	BackendTag       string    `json:"backend_tag,omitempty"`        // backend dialect for spec flags
+	Path             string    `json:"path,omitempty"`               // draft model GGUF path
+	DraftGPU         int       `json:"draft_gpu,omitempty"`          // CUDA device index for draft
+	CTXSizeDraft     int       `json:"ctx_size_draft,omitempty"`     // context size for draft
+	KVTypeDraft      string    `json:"kv_type_draft,omitempty"`      // KV type for draft
+	ThreadsDraft     int       `json:"threads_draft,omitempty"`      // threads for draft generation
+	GPULayersDraft   string    `json:"gpu_layers_draft,omitempty"`   // auto, all, or an exact count
+	SupportsDraftCTX bool      `json:"supports_draft_ctx,omitempty"` // backend accepts --ctx-size-draft
+	SpecAutoTune     bool      `json:"spec_autotune"`                // let llama.cpp auto-tune params
+	// Draft model params (calculated, not guessed)
+	DraftMax int     `json:"draft_max,omitempty"` // max draft tokens per batch
+	DraftMin int     `json:"draft_min,omitempty"` // min draft tokens per batch
+	PSplit   float64 `json:"p_split,omitempty"`   // speculative split probability
+	// Ngram params (explicit/profile-gated only; not an auto fallback)
+	SpecType     string `json:"spec_type,omitempty"` // ngram-map-k, ngram-mod, mtp, etc.
+	MTPFlag      bool   `json:"mtp_flag,omitempty"`  // ik_llama legacy MTP enable flag
+	NgramN       int    `json:"ngram_n,omitempty"`
+	NgramM       int    `json:"ngram_m,omitempty"`
+	NgramMinHits int    `json:"ngram_min_hits,omitempty"`
+	// VerifiedLaunchIdentity is copied from the exact performance profile and
+	// checked after all tune-cache/runtime flags have been applied.
+	VerifiedLaunchIdentity string `json:"-"`
+}
+
+// ComputeDraft decides the speculative decoding strategy for a target model.
+// It only enables draft-model speculation when a compatible local draft exists;
+// ngram speculation is explicit because it needs workload-specific proof.
+func ComputeDraft(target *ModelProfile, caps *detect.Capabilities, opts Options) *DraftConfig {
+	cfg := newDraftConfig(opts)
+
+	mode := normalizeSpecMode(opts.SpecMode)
+	if mode == "off" || caps == nil || len(caps.GPUs) == 0 || target == nil {
+		return cfg
+	}
+	// The current ik_llama server rejects every speculative stage chain with
+	// multiple slots (and explicitly strips MTP to avoid cross-slot corruption).
+	// Keep the normal parallel server usable and report speculation as off rather
+	// than emitting flags that are ignored or make startup fail. Mainline
+	// llama.cpp has its own parallel MTP implementation, so this is dialect-bound.
+	if opts.Parallel > 1 && backendSupportsMTP(opts.BackendTag) {
+		fmt.Fprintf(os.Stderr, "[spec] ik_llama speculative decoding requires --parallel 1; leaving it off for --parallel %d\n", opts.Parallel)
+		return cfg
+	}
+
+	modelDir := filepath.Dir(target.Path)
+
+	if mode == "mtp" {
+		configureMTPDraft(cfg, target, caps, opts, modelDir, true)
+		return cfg
+	}
+
+	if mode == "dflash" {
+		configureDFlashDraft(cfg, target, caps, opts, modelDir, true)
+		return cfg
+	}
+
+	if isNgramMode(mode) {
+		if target.IsMoE && !opts.ForceSpecMoE {
+			return cfg
+		}
+		configureNgramDraft(cfg, target, opts, mode)
+		return cfg
+	}
+
+	if mode == "auto" {
+		if configureMTPDraft(cfg, target, caps, opts, modelDir, false) {
+			return cfg
+		}
+		if configureDFlashDraft(cfg, target, caps, opts, modelDir, false) {
+			return cfg
+		}
+		if target.IsMoE && !opts.ForceSpecMoE {
+			fmt.Fprintf(os.Stderr, "[spec] auto found no proven MTP/DFlash performance profile; generic MoE speculation remains gated\n")
+			return cfg
+		}
+		if configureEagle3Draft(cfg, target, caps, opts, modelDir, false) {
+			return cfg
+		}
+		if configureValidatedDraftModel(cfg, target, caps, opts, findOrDownloadDraftCandidate(target, modelDir, opts.BackendTag), DraftModel, "") {
+			return cfg
+		}
+		fmt.Fprintf(os.Stderr, "[spec] auto found no compatible MTP/EAGLE/draft path; leaving speculative decoding off\n")
+		return cfg
+	}
+
+	if target.IsMoE && !opts.ForceSpecMoE {
+		return cfg
+	}
+
+	if mode == "eagle3" {
+		configureEagle3Draft(cfg, target, caps, opts, modelDir, true)
+		return cfg
+	}
+
+	if mode == "draft" {
+		configureValidatedDraftModel(cfg, target, caps, opts, findOrDownloadDraftCandidate(target, modelDir, opts.BackendTag), DraftModel, "")
+		return cfg
+	}
+
+	fmt.Fprintf(os.Stderr, "[spec] unknown speculative decoding mode %q; skipping\n", opts.SpecMode)
+	return cfg
+}
+
+func newDraftConfig(opts Options) *DraftConfig {
+	return &DraftConfig{
+		Type:             DraftNone,
+		BackendTag:       opts.BackendTag,
+		SpecAutoTune:     specAutoTuneSupported(opts.BackendTag, opts.BackendHelp),
+		SupportsDraftCTX: backendSupportsMTP(opts.BackendTag) || backendHelpSupports(opts.BackendHelp, "ctx-size-draft"),
+		DraftMax:         16,
+		PSplit:           0.1,
+	}
+}
+
+func configureMTPDraft(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, modelDir string, verbose bool) bool {
+	if modelSupportsMTP(target) {
+		if backendSupportsMTP(opts.BackendTag) {
+			cfg.Type = DraftMTP
+			cfg.SpecType = "mtp"
+			cfg.MTPFlag = true
+			cfg.DraftMax = defaultMTPDraftMax
+			if authorizeAutoSpecProfile(cfg, target, caps, opts, "mtp") {
+				return true
+			}
+			*cfg = *newDraftConfig(opts)
+		}
+		if backendHelpSupports(opts.BackendHelp, "draft-mtp") {
+			cfg.Type = DraftMTP
+			cfg.SpecType = "draft-mtp"
+			cfg.DraftMax = defaultMTPDraftMax
+			if authorizeAutoSpecProfile(cfg, target, caps, opts, "mtp") {
+				return true
+			}
+			*cfg = *newDraftConfig(opts)
+		}
+	}
+
+	// Mainline llama.cpp can load an MTP-only GGUF next to a target that does
+	// not bundle its prediction head. Never silently substitute a full model:
+	// validateSpecCandidate enforces NextN metadata and the draft-size ceiling.
+	if backendHelpSupports(opts.BackendHelp, "draft-mtp") {
+		candidate := findOrDownloadSpecializedCandidate(target, modelDir, opts, "mtp")
+		if configureValidatedSpecializedModel(cfg, target, caps, opts, candidate, DraftMTP, "draft-mtp", "mtp") {
+			cfg.DraftMax = defaultMTPDraftMax
+			if authorizeAutoSpecProfile(cfg, target, caps, opts, "mtp") {
+				return true
+			}
+			*cfg = *newDraftConfig(opts)
+		}
+	}
+	if verbose {
+		if !modelSupportsMTP(target) {
+			fmt.Fprintf(os.Stderr, "[spec] no embedded or compatible MTP-only prediction head was found; skipping\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "[spec] MTP requires ik_llama or a llama.cpp backend with draft-mtp support; skipping\n")
+		}
+	}
+	return false
+}
+
+func configureDFlashDraft(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, modelDir string, verbose bool) bool {
+	if backendSupportsMTP(opts.BackendTag) || !backendHelpSupports(opts.BackendHelp, "draft-dflash") {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "[spec] DFlash requires a llama.cpp backend with draft-dflash support; skipping\n")
+		}
+		return false
+	}
+	candidate := findOrDownloadSpecializedCandidate(target, modelDir, opts, "dflash")
+	if configureValidatedSpecializedModel(cfg, target, caps, opts, candidate, DraftDFlash, "draft-dflash", "dflash") {
+		if authorizeAutoSpecProfile(cfg, target, caps, opts, "dflash") {
+			return true
+		}
+		*cfg = *newDraftConfig(opts)
+	}
+	if verbose {
+		fmt.Fprintf(os.Stderr, "[spec] no compatible DFlash/DSpark drafter was found; skipping\n")
+	}
+	return false
+}
+
+func authorizeAutoSpecProfile(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, kind string) bool {
+	if normalizeSpecMode(opts.SpecMode) != "auto" {
+		return true
+	}
+	scope := NewSpecProfileScope(target, caps, opts, kind, cfg.Path)
+	profile, err := LoadSpecPerformanceProfile(opts.CacheDir, scope)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] Auto leaving %s off: no matching verified performance profile (%s)\n", strings.ToUpper(kind), scope.Key())
+		return false
+	}
+	if ok, reason := profile.AutoEligible(); !ok {
+		fmt.Fprintf(os.Stderr, "[spec] Auto leaving %s off: %s\n", strings.ToUpper(kind), reason)
+		return false
+	}
+	cfg.DraftMax = profile.DraftMax
+	cfg.VerifiedLaunchIdentity = profile.LaunchIdentity
+	fmt.Fprintf(os.Stderr, "[spec] Auto using proven %s profile %s: ceiling=%d, %.1f%% faster\n", strings.ToUpper(kind), profile.ScopeKey, profile.DraftMax, profile.ImprovementPct)
+	return true
+}
+
+func configureEagle3Draft(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, modelDir string, verbose bool) bool {
+	if !backendSupportsEagle3(opts) {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "[spec] EAGLE-3 requires a backend that advertises eagle3 support; skipping\n")
+		}
+		return false
+	}
+	candidate := findOrDownloadEagleCandidate(target, modelDir, opts.BackendTag)
+	if candidate == "" {
+		if verbose {
+			fmt.Fprintf(os.Stderr, "[spec] no compatible EAGLE-3 draft model found; skipping\n")
+		}
+		return false
+	}
+	return configureValidatedDraftModel(cfg, target, caps, opts, candidate, DraftEagle3, "eagle3")
+}
+
+func configureValidatedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, candidate string, draftType DraftType, specType string) bool {
+	if candidate == "" {
+		return false
+	}
+	kind := "draft"
+	if draftType == DraftEagle3 {
+		kind = "eagle3"
+	}
+	draftInfo, err := validateSpecCandidate(candidate, target, opts.BackendTag, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] rejecting draft %s: %v\n", filepath.Base(candidate), err)
+		return false
+	}
+	if draftType == DraftModel && !sameDraftArchitecture(target.ModelArch, draftInfo.Architecture) {
+		fmt.Fprintf(os.Stderr, "[spec] rejecting draft %s: architecture mismatch draft=%s target=%s\n", filepath.Base(candidate), draftInfo.Architecture, target.ModelArch)
+		return false
+	}
+	return applyParsedDraftModel(cfg, target, caps, opts, candidate, draftInfo, draftType, specType)
+}
+
+func configureValidatedSpecializedModel(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, candidate string, draftType DraftType, specType, kind string) bool {
+	if candidate == "" {
+		return false
+	}
+	draftInfo, err := validateSpecCandidate(candidate, target, opts.BackendTag, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] rejecting %s companion %s: %v\n", strings.ToUpper(kind), filepath.Base(candidate), err)
+		return false
+	}
+	if err := validateSpecCandidateBackend(candidate, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] rejecting %s companion %s: selected backend cannot load it: %v\n", strings.ToUpper(kind), filepath.Base(candidate), err)
+		return false
+	}
+	return applyParsedDraftModel(cfg, target, caps, opts, candidate, draftInfo, draftType, specType)
+}
+
+func validateSpecCandidateBackend(path string, opts Options) error {
+	if opts.SpecCandidateValidator == nil {
+		if normalizeSpecMode(opts.SpecMode) == "auto" {
+			return fmt.Errorf("selected backend has no no-allocation companion loader; Auto requires loader verification")
+		}
+		return nil
+	}
+	return opts.SpecCandidateValidator(path)
+}
+
+// EmbeddedMTPContextMB returns the metadata-derived KV reservation for the
+// additional MTP context created against an embedded NextN head. Target-model
+// KV measurements cannot be reused: they describe the full trunk, while this
+// context executes only the appended NextN blocks. Hybrid Qwen MTP blocks use
+// dense attention, so SSM/SWA traits are deliberately cleared.
+func EmbeddedMTPContextMB(model *ModelProfile, ctxSize int, kvType string) int {
+	if model == nil || model.NextNPredictLayers <= 0 || ctxSize <= 0 {
+		return 0
+	}
+	mtp := *model
+	mtp.NumLayers = model.NextNPredictLayers
+	mtp.HasSSM = 0
+	mtp.SlidingWindow = 0
+	mtp.FullAttnInterval = 0
+	mtp.MeasuredKVBytesPerTok = nil
+	return computeKVTotalMB(&mtp, ctxSize, kvType)
+}
+
+func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.Capabilities, opts Options, candidate string, draftInfo *gguf.Info, draftType DraftType, specType string) bool {
+	cfg.Type = draftType
+	cfg.SpecType = specType
+	cfg.Path = candidate
+	if !backendSupportsMTP(opts.BackendTag) {
+		cfg.GPULayersDraft = "all"
+	}
+
+	draftCTX := target.ContextSize
+	if draftCTX <= 0 {
+		draftCTX = draftInfo.ContextLength
+	}
+	if draftInfo.ContextLength > 0 && draftInfo.ContextLength < draftCTX {
+		draftCTX = draftInfo.ContextLength
+	}
+	cfg.CTXSizeDraft = draftCTX
+
+	draftSizeMB := int(draftInfo.ExpertBytes+draftInfo.NonExpertBytes) / (1024 * 1024)
+	if draftSizeMB <= 0 {
+		draftSizeMB = 1024
+	}
+	cfg.KVTypeDraft = computeDraftKVType(caps, draftInfo)
+	draftKVMB := computeKVTotalMB(&ModelProfile{
+		HeadCountKV:      draftInfo.HeadCountKV,
+		KeyLength:        draftInfo.KeyLength,
+		ValueLength:      draftInfo.ValueLength,
+		NumLayers:        draftInfo.BlockCount,
+		KVLoraRank:       draftInfo.KVLoraRank,
+		QLoraRank:        draftInfo.QLoraRank,
+		HasSSM:           draftInfo.SSM,
+		SlidingWindow:    draftInfo.SlidingWindow,
+		FullAttnInterval: draftInfo.FullAttnInterval,
+	}, draftCTX, cfg.KVTypeDraft)
+
+	cfg.DraftGPU = findDraftGPU(caps, target, draftSizeMB+draftKVMB+computeFloorMB)
+	if caps.CPU.Cores >= 4 {
+		cfg.ThreadsDraft = 2
+	} else {
+		cfg.ThreadsDraft = caps.CPU.Cores
+	}
+	return true
+}
+
+func normalizeSpecMode(mode string) string {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case "", "off", "none", "false", "0":
+		return "off"
+	case "auto":
+		return "auto"
+	case "draft", "draft-model", "draft_model", "model":
+		return "draft"
+	case "eagle", "eagle3", "eagle-3":
+		return "eagle3"
+	case "dflash", "draft-dflash", "dspark", "dflash-draft":
+		return "dflash"
+	case "ngram", "ngram-map", "ngram-map-k", "ngram-k":
+		return "ngram"
+	case "ngram-mod", "ngram_mod", "mod", "self", "self-spec", "self-speculative":
+		return "ngram-mod"
+	case "ngram-k4v", "ngram-map-k4v", "k4v":
+		return "ngram-k4v"
+	case "mtp", "draft-mtp":
+		return "mtp"
+	default:
+		return mode
+	}
+}
+
+func modelSupportsMTP(target *ModelProfile) bool {
+	if target == nil {
+		return false
+	}
+	return target.NextNPredictLayers > 0
+}
+
+func isNgramMode(mode string) bool {
+	return mode == "ngram" || mode == "ngram-mod" || mode == "ngram-k4v"
+}
+
+func configureNgramDraft(cfg *DraftConfig, target *ModelProfile, opts Options, mode string) {
+	specType := chooseNgramSpecType(opts, mode)
+	if specType == "" {
+		return
+	}
+	cfg.Type = DraftNgram
+	cfg.SpecType = specType
+	cfg.NgramMinHits = 1
+
+	switch specType {
+	case "ngram-mod":
+		cfg.NgramN = 24
+		cfg.DraftMin = 48
+		cfg.DraftMax = 64
+		if target != nil && !target.IsMoE && mode != "auto" {
+			cfg.DraftMin = 8
+			cfg.DraftMax = 48
+		}
+	case "ngram-map-k4v":
+		cfg.NgramN = 8
+		cfg.NgramM = 8
+		cfg.NgramMinHits = 2
+		cfg.DraftMax = 64
+	default:
+		cfg.NgramN = 12
+		cfg.NgramM = 48
+		cfg.NgramMinHits = 1
+	}
+}
+
+func chooseNgramSpecType(opts Options, mode string) string {
+	if backendSupportsMTP(opts.BackendTag) {
+		if mode == "ngram-mod" || mode == "ngram-k4v" {
+			fmt.Fprintf(os.Stderr, "[spec] %s is not supported by ik_llama; using ngram map-k\n", mode)
+		}
+		return "ngram - map - k"
+	}
+
+	supports := func(specType string) bool {
+		if opts.BackendHelp == "" {
+			return specType == "ngram-map-k"
+		}
+		return backendHelpSupports(opts.BackendHelp, specType)
+	}
+	fallbackMapK := func() string {
+		if supports("ngram-map-k") {
+			return "ngram-map-k"
+		}
+		if supports("ngram-mod") {
+			return "ngram-mod"
+		}
+		return ""
+	}
+
+	switch mode {
+	case "auto":
+		if supports("ngram-mod") {
+			return "ngram-mod"
+		}
+		if supports("ngram-map-k4v") {
+			return "ngram-map-k4v"
+		}
+		return fallbackMapK()
+	case "ngram-mod":
+		if supports("ngram-mod") {
+			return "ngram-mod"
+		}
+		fmt.Fprintf(os.Stderr, "[spec] backend does not expose ngram-mod; using ngram-map-k\n")
+		return fallbackMapK()
+	case "ngram-k4v":
+		if supports("ngram-map-k4v") {
+			return "ngram-map-k4v"
+		}
+		fmt.Fprintf(os.Stderr, "[spec] backend does not expose ngram-map-k4v; using ngram-map-k\n")
+		return fallbackMapK()
+	default:
+		return fallbackMapK()
+	}
+}
+
+func specAutoTuneSupported(backendTag, backendHelp string) bool {
+	if backendSupportsMTP(backendTag) {
+		return true
+	}
+	return backendHelpSupports(backendHelp, "spec-autotune")
+}
+
+func backendSupportsEagle3(opts Options) bool {
+	return !backendSupportsMTP(opts.BackendTag) && backendHelpSupports(opts.BackendHelp, "eagle3")
+}
+
+func sameDraftArchitecture(targetArch, draftArch string) bool {
+	targetArch = strings.ToLower(strings.TrimSpace(targetArch))
+	draftArch = strings.ToLower(strings.TrimSpace(draftArch))
+	if targetArch == "" || draftArch == "" || targetArch == "unknown" || draftArch == "unknown" {
+		return true
+	}
+	return targetArch == draftArch
+}
+
+func backendHelpSupports(help, token string) bool {
+	if help == "" || token == "" {
+		return false
+	}
+	return strings.Contains(strings.ToLower(help), strings.ToLower(token))
+}
+
+// findDraftCandidate scans the model directory for a small GGUF model with
+// the same tokenizer vocabulary as the target. Returns the path to the best
+// candidate (smallest matching model), or empty string if none found.
+func findDraftCandidate(target *ModelProfile, modelDir string) string {
+	if modelDir == "" {
+		return ""
+	}
+
+	entries, err := os.ReadDir(modelDir)
+	if err != nil {
+		return ""
+	}
+
+	type candidate struct {
+		path string
+		size int64
+	}
+	var matches []candidate
+
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".gguf") {
+			continue
+		}
+		candPath := filepath.Join(modelDir, e.Name())
+		if candPath == target.Path {
+			continue // skip self
+		}
+
+		// os.Stat follows symlinks; e.Info() would report the link's own size.
+		info, err := os.Stat(candPath)
+		if err != nil {
+			continue
+		}
+
+		// Quick size filter: draft should be small (< 15% of target) when
+		// target size is known.
+		if target.TotalSizeMB > 0 {
+			targetSizeMB := float64(target.TotalSizeMB)
+			candSizeMB := float64(info.Size()) / (1024 * 1024)
+			if candSizeMB > targetSizeMB*0.15 {
+				continue
+			}
+		}
+
+		// Parse GGUF metadata to check vocabulary match
+		ginfo, err := gguf.Parse(candPath)
+		if err != nil {
+			continue
+		}
+
+		// Must share the same tokenizer: exact vocab size match
+		if ginfo.VocabSize == 0 || ginfo.VocabSize != target.VocabSize {
+			continue
+		}
+
+		matches = append(matches, candidate{path: candPath, size: info.Size()})
+	}
+
+	if len(matches) == 0 {
+		return ""
+	}
+
+	// Pick the smallest matching candidate (prefer lightweight drafts)
+	sort.Slice(matches, func(i, j int) bool {
+		return matches[i].size < matches[j].size
+	})
+
+	return matches[0].path
+}
+
+func findEagleCandidate(target *ModelProfile, modelDir string) string {
+	if modelDir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(modelDir)
+	if err != nil {
+		return ""
+	}
+	type candidate struct {
+		path string
+		size int64
+	}
+	var matches []candidate
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".gguf") || !strings.Contains(strings.ToLower(e.Name()), "eagle") {
+			continue
+		}
+		candPath := filepath.Join(modelDir, e.Name())
+		if target != nil && candPath == target.Path {
+			continue
+		}
+		// os.Stat follows symlinks; e.Info() would report the link's own size.
+		info, err := os.Stat(candPath)
+		if err != nil {
+			continue
+		}
+		ginfo, err := gguf.Parse(candPath)
+		if err != nil {
+			continue
+		}
+		if target != nil && target.VocabSize > 0 && ginfo.VocabSize > 0 && ginfo.VocabSize != target.VocabSize {
+			continue
+		}
+		matches = append(matches, candidate{path: candPath, size: info.Size()})
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].size < matches[j].size })
+	return matches[0].path
+}
+
+func findSpecializedCandidate(target *ModelProfile, modelDir string, opts Options, kind string) string {
+	if target == nil || modelDir == "" {
+		return ""
+	}
+	entries, err := os.ReadDir(modelDir)
+	if err != nil {
+		return ""
+	}
+	type candidate struct {
+		path string
+		size int64
+		rank int
+	}
+	var matches []candidate
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name())
+		if entry.IsDir() || !strings.HasSuffix(name, ".gguf") || !draftFilenameLooksRelevantForKind(name, kind) {
+			continue
+		}
+		path := filepath.Join(modelDir, entry.Name())
+		if path == target.Path {
+			continue
+		}
+		fi, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if err := verifyKnownLocalSpecArtifact(path, target, kind); err != nil {
+			fmt.Fprintf(os.Stderr, "[spec] rejecting pinned companion %s: %v\n", entry.Name(), err)
+			continue
+		}
+		if _, err := validateSpecCandidate(path, target, opts.BackendTag, kind); err != nil {
+			continue
+		}
+		if err := validateSpecCandidateBackend(path, opts); err != nil {
+			fmt.Fprintf(os.Stderr, "[spec] rejecting local %s companion %s: selected backend cannot load it: %v\n", strings.ToUpper(kind), entry.Name(), err)
+			continue
+		}
+		matches = append(matches, candidate{path: path, size: fi.Size(), rank: draftCandidateRank(path, kind)})
+	}
+	if len(matches) == 0 {
+		return ""
+	}
+	sort.Slice(matches, func(i, j int) bool {
+		if matches[i].rank != matches[j].rank {
+			return matches[i].rank < matches[j].rank
+		}
+		return matches[i].size < matches[j].size
+	})
+	return matches[0].path
+}
+
+func backendSupportsMTP(backendTag string) bool {
+	backendTag = strings.ToLower(strings.TrimSpace(backendTag))
+	return backendTag == "ik" || backendTag == "ik_llama" || strings.Contains(backendTag, "ik_llama")
+}
+
+func ngramSpecType(backendTag string) string {
+	return "ngram-map-k"
+}
+
+func findOrDownloadDraftCandidate(target *ModelProfile, modelDir, backendTag string) string {
+	if local := findDraftCandidate(target, modelDir); local != "" {
+		if _, err := validateDraftCandidate(local, target, backendTag); err == nil {
+			return local
+		} else {
+			fmt.Fprintf(os.Stderr, "[spec] ignoring local draft %s: %v\n", filepath.Base(local), err)
+		}
+	}
+	if os.Getenv("LLM_SERVER_SKIP_DRAFT_DOWNLOAD") == "1" {
+		return ""
+	}
+	path, err := downloadDraftCandidate(target, modelDir, backendTag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] %v\n", err)
+		return ""
+	}
+	return path
+}
+
+func findOrDownloadEagleCandidate(target *ModelProfile, modelDir, backendTag string) string {
+	if local := findEagleCandidate(target, modelDir); local != "" {
+		if _, err := validateDraftCandidate(local, target, backendTag); err == nil {
+			return local
+		} else {
+			fmt.Fprintf(os.Stderr, "[spec] ignoring local EAGLE draft %s: %v\n", filepath.Base(local), err)
+		}
+	}
+	if os.Getenv("LLM_SERVER_SKIP_DRAFT_DOWNLOAD") == "1" {
+		return ""
+	}
+	path, err := downloadEagleCandidate(target, modelDir, backendTag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] %v\n", err)
+		return ""
+	}
+	return path
+}
+
+func findOrDownloadSpecializedCandidate(target *ModelProfile, modelDir string, opts Options, kind string) string {
+	if local := findSpecializedCandidate(target, modelDir, opts, kind); local != "" {
+		return local
+	}
+	if os.Getenv("LLM_SERVER_SKIP_DRAFT_DOWNLOAD") == "1" {
+		return ""
+	}
+	path, err := downloadSpecCandidate(target, modelDir, opts, kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[spec] %v\n", err)
+		return ""
+	}
+	return path
+}
+
+func validateDraftCandidate(path string, target *ModelProfile, backendTag string) (*gguf.Info, error) {
+	return validateSpecCandidate(path, target, backendTag, "draft")
+}
+
+func validateSpecCandidate(path string, target *ModelProfile, backendTag, kind string) (*gguf.Info, error) {
+	info, err := gguf.Parse(path)
+	if err != nil {
+		return nil, fmt.Errorf("parse failed: %w", err)
+	}
+	if info == nil {
+		return nil, fmt.Errorf("empty metadata")
+	}
+	if info.Architecture == "" || info.Architecture == "unknown" {
+		return nil, fmt.Errorf("unknown architecture")
+	}
+	arch := strings.ToLower(strings.TrimSpace(info.Architecture))
+	if strings.Contains(arch, "dflash") && backendSupportsMTP(backendTag) {
+		return nil, fmt.Errorf("dflash-draft is not supported by ik_llama")
+	}
+	if target != nil && target.VocabSize > 0 && info.VocabSize > 0 && info.VocabSize != target.VocabSize {
+		return nil, fmt.Errorf("vocab mismatch: draft=%d target=%d", info.VocabSize, target.VocabSize)
+	}
+	if target != nil && target.TokenizerModel != "" && info.TokenizerModel != "" && !strings.EqualFold(target.TokenizerModel, info.TokenizerModel) {
+		return nil, fmt.Errorf("tokenizer model mismatch: draft=%s target=%s", info.TokenizerModel, target.TokenizerModel)
+	}
+	if target != nil && target.TokenizerPre != "" && info.TokenizerPre != "" && !strings.EqualFold(target.TokenizerPre, info.TokenizerPre) {
+		return nil, fmt.Errorf("tokenizer preprocessor mismatch: draft=%s target=%s", info.TokenizerPre, target.TokenizerPre)
+	}
+	if target != nil && (kind == "mtp" || kind == "dflash" || kind == "eagle3") && target.EmbeddingLength > 0 && info.EmbeddingLength > 0 && info.EmbeddingLength != target.EmbeddingLength {
+		return nil, fmt.Errorf("embedding mismatch: draft=%d target=%d", info.EmbeddingLength, target.EmbeddingLength)
+	}
+	switch kind {
+	case "mtp":
+		if info.NextNPredictLayers <= 0 {
+			return nil, fmt.Errorf("GGUF has no NextN/MTP prediction layers")
+		}
+		if err := validateSpecializedCompatibilityIdentity(target, info, kind, backendTag); err != nil {
+			return nil, err
+		}
+	case "dflash":
+		if !strings.Contains(arch, "dflash") {
+			return nil, fmt.Errorf("architecture %s is not a DFlash drafter", info.Architecture)
+		}
+		if err := validateSpecializedCompatibilityIdentity(target, info, kind, backendTag); err != nil {
+			return nil, err
+		}
+	}
+	expectedBytes := info.NonExpertBytes + info.ExpertBytes
+	if expectedBytes > 0 {
+		fi, err := os.Stat(path)
+		if err != nil {
+			return nil, fmt.Errorf("stat failed: %w", err)
+		}
+		if fi.Size() < int64(expectedBytes) {
+			return nil, fmt.Errorf("incomplete file: %d bytes, expected at least %d", fi.Size(), expectedBytes)
+		}
+		if target != nil && target.TotalSizeMB > 0 {
+			candMB := float64(fi.Size()) / (1024 * 1024)
+			if candMB > float64(target.TotalSizeMB)*0.30 {
+				return nil, fmt.Errorf("draft too large: %.0fMB target=%dMB", candMB, target.TotalSizeMB)
+			}
+		}
+	}
+	return info, nil
+}
+
+func validateSpecializedCompatibilityIdentity(target *ModelProfile, info *gguf.Info, kind, backendTag string) error {
+	if target == nil || info == nil {
+		return fmt.Errorf("cannot prove %s target/companion identity", strings.ToUpper(kind))
+	}
+	targetArch := strings.ToLower(strings.TrimSpace(target.ModelArch))
+	companionArch := strings.ToLower(strings.TrimSpace(info.Architecture))
+	if targetArch == "" || targetArch == "unknown" {
+		return fmt.Errorf("target architecture is missing; refusing unproven %s companion", strings.ToUpper(kind))
+	}
+	if !specializedArchitectureCompatibleForBackend(target, kind, companionArch, backendTag) {
+		return fmt.Errorf("architecture mismatch: companion=%s target=%s backend=%s", info.Architecture, target.ModelArch, backendTag)
+	}
+	if target.EmbeddingLength <= 0 || info.EmbeddingLength <= 0 || target.EmbeddingLength != info.EmbeddingLength {
+		return fmt.Errorf("embedding identity mismatch: companion=%d target=%d", info.EmbeddingLength, target.EmbeddingLength)
+	}
+	if target.VocabSize <= 0 || info.VocabSize <= 0 || target.VocabSize != info.VocabSize {
+		return fmt.Errorf("vocab identity mismatch: companion=%d target=%d", info.VocabSize, target.VocabSize)
+	}
+	if target.TokenizerHash != "" || info.TokenizerHash != "" {
+		if target.TokenizerHash == "" || info.TokenizerHash == "" {
+			return fmt.Errorf("tokenizer hash missing on one side; refusing unproven %s companion", strings.ToUpper(kind))
+		}
+		if !strings.EqualFold(target.TokenizerHash, info.TokenizerHash) {
+			return fmt.Errorf("tokenizer hash mismatch")
+		}
+		return nil
+	}
+	if target.TokenizerModel == "" || info.TokenizerModel == "" ||
+		target.TokenizerPre == "" || info.TokenizerPre == "" {
+		return fmt.Errorf("tokenizer identity metadata is incomplete; refusing unproven %s companion", strings.ToUpper(kind))
+	}
+	if !strings.EqualFold(target.TokenizerModel, info.TokenizerModel) || !strings.EqualFold(target.TokenizerPre, info.TokenizerPre) {
+		return fmt.Errorf("tokenizer identity mismatch: companion=%s/%s target=%s/%s", info.TokenizerModel, info.TokenizerPre, target.TokenizerModel, target.TokenizerPre)
+	}
+	return nil
+}
+
+func downloadDraftCandidate(target *ModelProfile, modelDir, backendTag string) (string, error) {
+	return downloadSpecCandidate(target, modelDir, Options{BackendTag: backendTag}, "draft")
+}
+
+func downloadEagleCandidate(target *ModelProfile, modelDir, backendTag string) (string, error) {
+	return downloadSpecCandidate(target, modelDir, Options{BackendTag: backendTag}, "eagle3")
+}
+
+func downloadSpecCandidate(target *ModelProfile, modelDir string, opts Options, kind string) (string, error) {
+	if target == nil || modelDir == "" {
+		return "", fmt.Errorf("no model directory for draft lookup")
+	}
+	basename := draftLookupBase(target)
+	if basename == "" {
+		return "", fmt.Errorf("no model basename for draft lookup")
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	downloadClient := &http.Client{Timeout: 20 * time.Minute}
+
+	var repoCandidates []string
+	addRepo := func(repo string) {
+		repo = strings.Trim(repo, "/")
+		if repo == "" {
+			return
+		}
+		for _, existing := range repoCandidates {
+			if existing == repo {
+				return
+			}
+		}
+		repoCandidates = append(repoCandidates, repo)
+	}
+	// Auto never promotes a mutable search result directly into a launch. It may
+	// use a local, fully validated companion or a reviewed immutable manifest.
+	// Explicit --spec requests retain discovery so users can deliberately test a
+	// new artifact; metadata, backend-loader and memory gates still apply.
+	reviewedOnly := !openSpecializedDiscoveryAllowed(opts, kind)
+	if !reviewedOnly && target.QuantizedBy != "" {
+		addRepo(target.QuantizedBy + "/" + basename + "-GGUF")
+		if target.Name != "" && target.Name != basename {
+			addRepo(target.QuantizedBy + "/" + target.Name + "-GGUF")
+		}
+	}
+	for _, repo := range knownSpecializedRepos(target, kind) {
+		addRepo(repo)
+	}
+	if !reviewedOnly {
+		for _, q := range []string{"unsloth", "bartowski", "lmstudio-community"} {
+			if q == target.QuantizedBy {
+				continue
+			}
+			addRepo(q + "/" + basename + "-GGUF")
+		}
+		for _, repo := range searchHFDraftRepos(client, target, kind) {
+			addRepo(repo)
+		}
+	}
+
+	safeBasename := sanitizeFilename(basename)
+	if safeBasename == "" {
+		safeBasename = "model"
+	}
+	for _, repo := range repoCandidates {
+		if reason := unsupportedSpecializedRepo(repo, kind); reason != "" {
+			fmt.Fprintf(os.Stderr, "[spec] skipping %s: %s\n", repo, reason)
+			continue
+		}
+		if (kind == "mtp" || kind == "dflash") && !hfRepoGGUFArchitectureCompatible(client, repo, target, kind, opts.BackendTag) {
+			continue
+		}
+		paths := listRepoDraftCandidates(client, repo, kind)
+		seen := map[string]bool{}
+		for _, remotePath := range paths {
+			if remotePath == "" || seen[remotePath] {
+				continue
+			}
+			seen[remotePath] = true
+			remoteBase := filepath.Base(remotePath)
+			safeRemote := sanitizeFilename(remoteBase)
+			if safeRemote == "" {
+				safeRemote = "draft.gguf"
+			}
+			dest := filepath.Join(modelDir, "draft-"+safeBasename+"-"+safeRemote)
+			if _, err := os.Stat(dest); err == nil {
+				if verifyErr := verifyKnownSpecArtifact(dest, repo, remotePath); verifyErr == nil {
+					if _, err := validateSpecCandidate(dest, target, opts.BackendTag, kind); err == nil && validateSpecCandidateBackend(dest, opts) == nil {
+						fmt.Fprintf(os.Stderr, "[spec] Found compatible draft model: %s\n", dest)
+						return dest, nil
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "[spec] pinned artifact verification failed for %s: %v\n", dest, verifyErr)
+				}
+			}
+
+			dlURL := hfResolveURLAt(repo, remotePath, knownSpecializedRepoRevision(repo))
+			headResp, err := client.Head(dlURL)
+			if err != nil || headResp.StatusCode != http.StatusOK || !hfCandidateSizeOK(headResp, target) {
+				if headResp != nil && headResp.Body != nil {
+					headResp.Body.Close()
+				}
+				continue
+			}
+			headResp.Body.Close()
+
+			fmt.Fprintf(os.Stderr, "[spec] Downloading draft model from %s: %s\n", repo, remotePath)
+			tmpDest := dest + ".tmp"
+			if err := downloadFile(downloadClient, dlURL, tmpDest); err != nil {
+				fmt.Fprintf(os.Stderr, "[spec] download interrupted for %s: %v; partial file kept for resume: %s\n", remotePath, err, tmpDest)
+				continue
+			}
+			if !isGGUF(tmpDest) {
+				fmt.Fprintf(os.Stderr, "[spec] Downloaded draft is not a valid GGUF, removing\n")
+				os.Remove(tmpDest)
+				continue
+			}
+			if err := verifyKnownSpecArtifact(tmpDest, repo, remotePath); err != nil {
+				fmt.Fprintf(os.Stderr, "[spec] Downloaded pinned artifact failed integrity verification: %v, removing\n", err)
+				os.Remove(tmpDest)
+				continue
+			}
+			if _, err := validateSpecCandidate(tmpDest, target, opts.BackendTag, kind); err != nil {
+				fmt.Fprintf(os.Stderr, "[spec] Downloaded draft does not match: %v, removing\n", err)
+				os.Remove(tmpDest)
+				if draftValidationRepoWideMismatch(err) {
+					break
+				}
+				continue
+			}
+			if err := validateSpecCandidateBackend(tmpDest, opts); err != nil {
+				fmt.Fprintf(os.Stderr, "[spec] Downloaded draft is unsupported by the selected backend: %v, removing\n", err)
+				os.Remove(tmpDest)
+				continue
+			}
+			if err := os.Rename(tmpDest, dest); err != nil {
+				os.Remove(tmpDest)
+				return "", fmt.Errorf("rename draft: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "[spec] Downloaded draft model: %s\n", dest)
+			return dest, nil
+		}
+	}
+	return "", fmt.Errorf("no compatible draft model found on HuggingFace")
+}
+
+func openSpecializedDiscoveryAllowed(opts Options, kind string) bool {
+	if normalizeSpecMode(opts.SpecMode) != "auto" {
+		return true
+	}
+	switch kind {
+	case "mtp", "dflash", "eagle3":
+		return false
+	default:
+		return true
+	}
+}
+
+func hfRepoGGUFArchitectureCompatible(client *http.Client, repo string, target *ModelProfile, kind, backendTag string) bool {
+	if client == nil || repo == "" {
+		return false
+	}
+	apiURL := "https://huggingface.co/api/models/" + strings.Trim(repo, "/")
+	if revision := knownSpecializedRepoRevision(repo); revision != "" && revision != "main" {
+		apiURL += "/revision/" + url.PathEscape(revision)
+	}
+	resp, err := client.Get(apiURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return false
+	}
+	defer resp.Body.Close()
+	var metadata struct {
+		GGUF struct {
+			Architecture string `json:"architecture"`
+		} `json:"gguf"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+		return false
+	}
+	return specializedArchitectureCompatibleForBackend(target, kind, metadata.GGUF.Architecture, backendTag)
+}
+
+func specializedArchitectureCompatible(target *ModelProfile, kind, candidateArch string) bool {
+	return specializedArchitectureCompatibleForBackend(target, kind, candidateArch, "")
+}
+
+func specializedArchitectureCompatibleForBackend(target *ModelProfile, kind, candidateArch, backendTag string) bool {
+	candidateArch = strings.ToLower(strings.TrimSpace(candidateArch))
+	if candidateArch == "" || candidateArch == "unknown" || target == nil {
+		return false
+	}
+	targetArch := strings.ToLower(strings.TrimSpace(target.ModelArch))
+	switch kind {
+	case "mtp":
+		if targetArch != "" && targetArch != "unknown" && targetArch == candidateArch {
+			return true
+		}
+		return reviewedSpecializedArchitecturePair(kind, targetArch, candidateArch, backendTag)
+	case "dflash":
+		if !strings.Contains(candidateArch, "dflash") {
+			return false
+		}
+		return targetArch == "" || targetArch == "unknown" || candidateArch == targetArch || strings.HasPrefix(candidateArch, targetArch+"-")
+	default:
+		return true
+	}
+}
+
+func knownSpecializedRepos(target *ModelProfile, kind string) []string {
+	var repos []string
+	seen := map[string]bool{}
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if !manifest.AutoApproved || manifest.Kind != kind || !manifestTargetMatches(manifest, target) || seen[manifest.Repo] {
+			continue
+		}
+		seen[manifest.Repo] = true
+		repos = append(repos, manifest.Repo)
+	}
+	return repos
+}
+
+func unsupportedSpecializedRepo(repo, kind string) string {
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if manifest.Kind == kind && strings.EqualFold(strings.Trim(repo, "/"), manifest.Repo) && manifest.UnsupportedReason != "" {
+			return manifest.UnsupportedReason
+		}
+	}
+	return ""
+}
+
+const (
+	deepSeekV4DFlashRepo     = "Lucebox/DeepSeek-V4-Flash-DSpark-Drafter-GGUF"
+	deepSeekV4DFlashFile     = "DeepSeek-V4-Flash-DSpark-draft-Q4RMFP4-denseF16.gguf"
+	deepSeekV4DFlashRevision = "7c74cca4d266f084b5e14dc68c77e922cfed17ea"
+	deepSeekV4DFlashSHA256   = "48883d35b8a67ecfd2858a90e12a47d04cb5ac581acef868ca0f58544816f746"
+	deepSeekV4DFlashSize     = int64(11304737056)
+
+	deepSeekV4MTPRepo     = "antirez/deepseek-v4-gguf"
+	deepSeekV4MTPFile     = "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
+	deepSeekV4MTPRevision = "9170bf42beb77f38006e016503ecace31f2bd9a0"
+	deepSeekV4MTPSHA256   = "afd481ee689dce9037f70f39085fcdae5a5b096d521cdad43b19fa52bf8f4083"
+	deepSeekV4MTPSize     = int64(3807602400)
+)
+
+type specializedArtifactManifest struct {
+	Kind          string
+	Repo          string
+	Revision      string
+	File          string
+	SHA256        string
+	Size          int64
+	TargetArch    string
+	CompanionArch string
+	BackendTags   []string
+	// CompatibilityApproved permits deliberate explicit testing of a reviewed
+	// cross-architecture pair. AutoApproved is separate and additionally
+	// requires the repeatable performance/correctness path.
+	CompatibilityApproved bool
+	AutoApproved          bool
+	UnsupportedReason     string
+}
+
+// These entries are executable policy, not recommendations. An artifact only
+// becomes AutoApproved after the exact target/companion pair passes the selected
+// backend loader, correctness checks, memory preflight and repeatable performance
+// harness. Known-incompatible entries remain pinned here so mutable HF names or
+// mirrors cannot make ggrun rediscover and download them as if they were new.
+var reviewedSpecializedArtifacts = []specializedArtifactManifest{
+	{
+		Kind: "dflash", Repo: deepSeekV4DFlashRepo, Revision: deepSeekV4DFlashRevision,
+		File: deepSeekV4DFlashFile, SHA256: deepSeekV4DFlashSHA256, Size: deepSeekV4DFlashSize,
+		TargetArch: "deepseek4", CompanionArch: "deepseek4-dflash-draft",
+		UnsupportedReason: "the published DeepSeek V4 drafter requires a separate Lucebox/DS4 runtime and cannot be loaded by a compatible llama-server backend",
+	},
+	{
+		Kind: "mtp", Repo: deepSeekV4MTPRepo, Revision: deepSeekV4MTPRevision,
+		File: deepSeekV4MTPFile, SHA256: deepSeekV4MTPSHA256, Size: deepSeekV4MTPSize,
+		TargetArch: "deepseek4", CompanionArch: "deepseek4_mtp_support", BackendTags: []string{"ds4"},
+		UnsupportedReason: "the reviewed DeepSeek V4 MTP companion requires the DS4-specific deepseek4_mtp_support loader; installed llama-server backends cannot load the target/companion pair",
+	},
+}
+
+func manifestTargetMatches(manifest specializedArtifactManifest, target *ModelProfile) bool {
+	if target == nil || manifest.TargetArch == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(target.ModelArch), manifest.TargetArch)
+}
+
+func manifestBackendMatches(manifest specializedArtifactManifest, backendTag string) bool {
+	backendTag = strings.ToLower(strings.TrimSpace(backendTag))
+	for _, allowed := range manifest.BackendTags {
+		allowed = strings.ToLower(strings.TrimSpace(allowed))
+		if backendTag == allowed || strings.Contains(backendTag, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewedSpecializedArchitecturePair(kind, targetArch, companionArch, backendTag string) bool {
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if !manifest.CompatibilityApproved || manifest.Kind != kind ||
+			!strings.EqualFold(manifest.TargetArch, targetArch) ||
+			!strings.EqualFold(manifest.CompanionArch, companionArch) ||
+			!manifestBackendMatches(manifest, backendTag) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func specializedArtifactFor(repo, remotePath string) (specializedArtifactManifest, bool) {
+	repo = strings.Trim(repo, "/")
+	file := filepath.Base(remotePath)
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if strings.EqualFold(repo, manifest.Repo) && strings.EqualFold(file, manifest.File) {
+			return manifest, true
+		}
+	}
+	return specializedArtifactManifest{}, false
+}
+
+func verifyKnownLocalSpecArtifact(path string, target *ModelProfile, kind string) error {
+	if !isDeepSeekV4FlashTarget(target) {
+		return nil
+	}
+	name := strings.ToLower(filepath.Base(path))
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if manifest.Kind == kind && manifest.UnsupportedReason != "" && strings.HasSuffix(name, strings.ToLower(sanitizeFilename(manifest.File))) {
+			return fmt.Errorf("known incompatible artifact: %s", manifest.UnsupportedReason)
+		}
+	}
+	return nil
+}
+
+func isDeepSeekV4FlashTarget(target *ModelProfile) bool {
+	if target == nil {
+		return false
+	}
+	identity := strings.ToLower(strings.Join([]string{target.Name, target.Basename, filepath.Base(target.Path), target.ModelArch}, " "))
+	return strings.Contains(identity, "deepseek") && strings.Contains(identity, "v4") && strings.Contains(identity, "flash")
+}
+
+func verifyKnownSpecArtifact(path, repo, remotePath string) error {
+	if manifest, ok := specializedArtifactFor(repo, remotePath); ok {
+		return verifyFileSHA256(path, manifest.Size, manifest.SHA256)
+	}
+	return nil
+}
+
+func verifyFileSHA256(path string, expectedSize int64, expectedSHA string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if expectedSize > 0 && fi.Size() != expectedSize {
+		return fmt.Errorf("size=%d, want %d", fi.Size(), expectedSize)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	got := fmt.Sprintf("%x", h.Sum(nil))
+	if expectedSHA != "" && !strings.EqualFold(got, expectedSHA) {
+		return fmt.Errorf("sha256=%s, want %s", got, expectedSHA)
+	}
+	return nil
+}
+
+func knownSpecializedRepoRevision(repo string) string {
+	for _, manifest := range reviewedSpecializedArtifacts {
+		if strings.EqualFold(strings.Trim(repo, "/"), manifest.Repo) {
+			return manifest.Revision
+		}
+	}
+	return "main"
+}
+
+func searchHFDraftRepos(client *http.Client, target *ModelProfile, kind string) []string {
+	repos := []string{}
+	seen := map[string]bool{}
+	addRepo := func(repo string) {
+		repo = strings.Trim(repo, "/")
+		if repo == "" || seen[repo] {
+			return
+		}
+		seen[repo] = true
+		repos = append(repos, repo)
+	}
+	for _, query := range hfSpecSearchQueries(target, kind) {
+		apiURL := "https://huggingface.co/api/models?limit=20&search=" + url.QueryEscape(query)
+		resp, err := client.Get(apiURL)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+		var rows []struct {
+			ID      string `json:"id"`
+			ModelID string `json:"modelId"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&rows); err != nil {
+			resp.Body.Close()
+			continue
+		}
+		resp.Body.Close()
+		for _, row := range rows {
+			repo := row.ID
+			if repo == "" {
+				repo = row.ModelID
+			}
+			if hfRepoLooksRelevant(repo, target, kind) {
+				addRepo(repo)
+			}
+		}
+	}
+	return repos
+}
+
+func hfSpecSearchQueries(target *ModelProfile, kind string) []string {
+	base := draftLookupBase(target)
+	pretty := strings.ReplaceAll(base, "-", " ")
+	family := draftFamilyName(base)
+	queries := []string{}
+	add := func(q string) {
+		q = strings.Join(strings.Fields(q), " ")
+		if q == "" {
+			return
+		}
+		for _, existing := range queries {
+			if strings.EqualFold(existing, q) {
+				return
+			}
+		}
+		queries = append(queries, q)
+	}
+	if kind == "eagle3" {
+		add(pretty + " EAGLE3 GGUF")
+		add(pretty + " EAGLE-3 GGUF")
+		add(base + " EAGLE3")
+		return queries
+	}
+	if kind == "mtp" {
+		add(pretty + " MTP ONLY GGUF")
+		add(pretty + " MTP GGUF")
+		add(base + " MTP")
+		return queries
+	}
+	if kind == "dflash" {
+		add(pretty + " DFlash GGUF")
+		add(pretty + " DSpark drafter GGUF")
+		add(base + " drafter GGUF")
+		return queries
+	}
+	add(pretty + " draft GGUF")
+	add(pretty + " drafter GGUF")
+	add(pretty + " speculative GGUF")
+	add(base + " draft")
+	if family != "" {
+		add(family + " draft GGUF")
+		add(family + " 0.5B GGUF")
+		add(family + " 0.6B GGUF")
+		add(family + " 0.8B GGUF")
+		add(family + " 1.5B GGUF")
+		add(family + " 3B GGUF")
+	}
+	if strings.Contains(strings.ToLower(target.ModelArch), "qwen35") || strings.Contains(strings.ToLower(base), "qwen3.6") {
+		add("Qwen3.5 0.8B GGUF")
+		add("Qwen3.5 draft GGUF")
+	}
+	return queries
+}
+
+func draftFamilyName(base string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return ""
+	}
+	parts := strings.Split(base, "-")
+	if len(parts) == 0 {
+		return base
+	}
+	if strings.Contains(strings.ToLower(parts[len(parts)-1]), "b") && len(parts) > 1 {
+		parts = parts[:len(parts)-1]
+	}
+	return strings.Join(parts, " ")
+}
+
+func hfRepoLooksRelevant(repo string, target *ModelProfile, kind string) bool {
+	repoLower := strings.ToLower(repo)
+	baseLower := strings.ToLower(draftLookupBase(target))
+	familyLower := compactHFToken(draftFamilyName(draftLookupBase(target)))
+	compactRepo := compactHFToken(repoLower)
+	archLower := compactHFToken(target.ModelArch)
+	if kind == "eagle3" {
+		return strings.Contains(repoLower, "eagle") && (baseLower == "" || strings.Contains(compactRepo, compactHFToken(baseLower)) || strings.Contains(compactRepo, familyLower))
+	}
+	if kind == "mtp" {
+		return strings.Contains(repoLower, "mtp") && (baseLower == "" || strings.Contains(compactRepo, compactHFToken(baseLower)) || strings.Contains(compactRepo, familyLower) || (archLower != "" && strings.Contains(compactRepo, archLower)))
+	}
+	if kind == "dflash" {
+		isDFlash := strings.Contains(repoLower, "dflash") || strings.Contains(repoLower, "dspark")
+		return isDFlash && (baseLower == "" || strings.Contains(compactRepo, compactHFToken(baseLower)) || strings.Contains(compactRepo, familyLower) || (archLower != "" && strings.Contains(compactRepo, archLower)))
+	}
+	if strings.Contains(repoLower, "draft") || strings.Contains(repoLower, "drafter") || strings.Contains(repoLower, "dflash") || strings.Contains(repoLower, "speculative") {
+		return true
+	}
+	return repoLooksLikeDraftRepo(repoLower) && (familyLower == "" || strings.Contains(compactRepo, familyLower) || (archLower != "" && strings.Contains(compactRepo, archLower)))
+}
+
+var smallDraftSizeRE = regexp.MustCompile(`(?i)(^|[-_/ .])(0\.5|0\.6|0\.8|1|1\.5|2|3)b($|[-_/ .])`)
+
+func repoLooksLikeDraftRepo(repoLower string) bool {
+	for _, token := range []string{"draft", "drafter", "dflash", "speculative", "eagle"} {
+		if strings.Contains(repoLower, token) {
+			return true
+		}
+	}
+	return smallDraftSizeRE.MatchString(repoLower)
+}
+
+func compactHFToken(value string) string {
+	value = strings.ToLower(value)
+	for _, old := range []string{"-", "_", ".", "/", " "} {
+		value = strings.ReplaceAll(value, old, "")
+	}
+	return value
+}
+
+func hfCandidateSizeOK(resp *http.Response, target *ModelProfile) bool {
+	if resp == nil || target == nil || target.TotalSizeMB <= 0 || resp.ContentLength <= 0 {
+		return true
+	}
+	maxBytes := int64(target.TotalSizeMB) * 1024 * 1024 * 30 / 100
+	return resp.ContentLength <= maxBytes
+}
+
+func hfResolveURL(repo, remotePath string) string {
+	return hfResolveURLAt(repo, remotePath, "main")
+}
+
+func hfResolveURLAt(repo, remotePath, revision string) string {
+	parts := strings.Split(remotePath, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	if revision == "" {
+		revision = "main"
+	}
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/%s/%s", repo, url.PathEscape(revision), strings.Join(parts, "/"))
+}
+
+func draftValidationRepoWideMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "vocab mismatch") || strings.Contains(msg, "architecture mismatch") || strings.Contains(msg, "not supported")
+}
+
+func draftLookupBase(target *ModelProfile) string {
+	for _, value := range []string{target.Basename, target.Name} {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return trimQuantSuffix(value)
+		}
+	}
+	base := strings.TrimSuffix(filepath.Base(target.Path), ".gguf")
+	return trimQuantSuffix(base)
+}
+
+func trimQuantSuffix(name string) string {
+	for _, suffix := range []string{"Q2_K", "Q3_K_S", "Q3_K_M", "Q3_K_L", "Q4_K_S", "Q4_K_M", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q5_K_L", "Q6_K", "Q8_0", "F16", "F32", "BF16", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ2_M", "IQ3_XXS", "IQ3_S", "IQ3_M", "IQ4_XS", "IQ4_NL"} {
+		if strings.HasSuffix(name, "-"+suffix) {
+			return strings.TrimSuffix(name, "-"+suffix)
+		}
+	}
+	return name
+}
+
+func listRepoDraftCandidates(client *http.Client, repo, kind string) []string {
+	revision := knownSpecializedRepoRevision(repo)
+	apiURL := fmt.Sprintf("https://huggingface.co/api/models/%s/tree/%s?recursive=1", repo, url.PathEscape(revision))
+	resp, err := client.Get(apiURL)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var items []struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return nil
+	}
+	var paths []string
+	for _, item := range items {
+		name := strings.ToLower(filepath.Base(item.Path))
+		if strings.HasSuffix(name, ".gguf") && !isNonTextDraftGGUFName(name) && (draftFilenameLooksRelevantForKind(name, kind) || (kind == "draft" && repoLooksLikeDraftRepo(strings.ToLower(repo)))) {
+			paths = append(paths, item.Path)
+		}
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return draftCandidateRank(paths[i], kind) < draftCandidateRank(paths[j], kind)
+	})
+	return paths
+}
+
+func draftFilenameLooksRelevant(name string) bool {
+	return draftFilenameLooksRelevantForKind(name, "draft")
+}
+
+func draftFilenameLooksRelevantForKind(name, kind string) bool {
+	name = strings.ToLower(name)
+	if isNonTextDraftGGUFName(name) {
+		return false
+	}
+	if kind == "eagle3" {
+		return strings.Contains(name, "eagle")
+	}
+	if kind == "mtp" {
+		return strings.Contains(name, "mtp")
+	}
+	if kind == "dflash" {
+		return strings.Contains(name, "dflash") || strings.Contains(name, "dspark") || strings.Contains(name, "drafter") || strings.Contains(name, "draft")
+	}
+	return strings.Contains(name, "draft") ||
+		strings.Contains(name, "dflash")
+}
+
+func isNonTextDraftGGUFName(name string) bool {
+	name = strings.ToLower(filepath.Base(name))
+	for _, token := range []string{"mmproj", "projector", "vision", "clip", "siglip", "vit", "encoder", "imatrix", "calibration", "dataset", "tokenizer"} {
+		if strings.Contains(name, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func draftCandidateRank(path, kind string) int {
+	name := strings.ToLower(filepath.Base(path))
+	score := 10
+	switch {
+	case kind == "eagle3" && strings.Contains(name, "eagle3"):
+		score = 0
+	case kind == "eagle3" && strings.Contains(name, "eagle"):
+		score = 1
+	case kind == "mtp" && strings.Contains(name, "mtp-only"):
+		score = 0
+	case kind == "mtp" && strings.Contains(name, "mtp"):
+		score = 1
+	case kind == "dflash" && (strings.Contains(name, "dspark") || strings.Contains(name, "dflash")):
+		score = 0
+	case strings.Contains(name, "draft"):
+		score = 0
+	case strings.Contains(name, "dflash"):
+		score = 2
+	case strings.Contains(name, "mtp"):
+		score = 3
+	}
+	return score*10 + draftQuantRank(name)
+}
+
+func draftQuantRank(name string) int {
+	name = strings.ToLower(name)
+	switch {
+	case strings.Contains(name, "q4_k_m") || strings.Contains(name, "q4_0") || strings.Contains(name, "q4_k_s"):
+		return 0
+	case strings.Contains(name, "iq4") || strings.Contains(name, "ud-q4"):
+		return 1
+	case strings.Contains(name, "q5_k_m") || strings.Contains(name, "q5_k_s"):
+		return 2
+	case strings.Contains(name, "q3") || strings.Contains(name, "iq3"):
+		return 3
+	case strings.Contains(name, "q6") || strings.Contains(name, "q8") || strings.Contains(name, "f16") || strings.Contains(name, "bf16"):
+		return 4
+	case strings.Contains(name, "q2") || strings.Contains(name, "iq2"):
+		return 5
+	default:
+		return 6
+	}
+}
+
+// findDraftGPU selects the GPU with the most free VRAM after the target model
+// loads its layers. This ensures the draft model has room without colliding.
+func findDraftGPU(caps *detect.Capabilities, target *ModelProfile, draftVRAMNeed int) int {
+	bestGPU := 0
+	bestFree := 0
+
+	for i, g := range caps.GPUs {
+		// Estimate target model's VRAM usage on this GPU
+		targetUse := estimateTargetVRAMUse(target, caps, i)
+		freeAfterTarget := g.VRAMTotalMB - targetUse - draftVRAMNeed
+
+		if freeAfterTarget > bestFree {
+			bestFree = freeAfterTarget
+			bestGPU = i
+		}
+	}
+	return bestGPU
+}
+
+// estimateTargetVRAMUse estimates how much VRAM the target model uses on a given GPU.
+func estimateTargetVRAMUse(target *ModelProfile, caps *detect.Capabilities, gpuIndex int) int {
+	if len(caps.GPUs) == 0 {
+		return 0
+	}
+
+	// For MoE: compute fixed overhead per GPU + per-layer cost
+	if target.IsMoE {
+		// Non-expert weight per GPU: proportional to VRAM share
+		totalFree := 0
+		for _, g := range caps.GPUs {
+			totalFree += g.VRAMTotalMB
+		}
+		if totalFree <= 0 {
+			return 0
+		}
+
+		share := float64(caps.GPUs[gpuIndex].VRAMTotalMB) / float64(totalFree)
+		nonExpertShare := float64(target.NonExpertBytes) / (1024 * 1024) * share
+
+		// Approximate this GPU's non-expert weight by its share of total VRAM;
+		// exact per-tensor placement isn't needed for this estimate.
+		return int(nonExpertShare)
+	}
+
+	// For dense: proportional tensor-split based on VRAM free values
+	totalFree := 0
+	for _, g := range caps.GPUs {
+		free := g.VRAMTotalMB - g.VRAMUsedMB
+		if free > 0 {
+			totalFree += free
+		}
+	}
+	if totalFree <= 0 {
+		return 0
+	}
+	share := float64(caps.GPUs[gpuIndex].VRAMTotalMB-caps.GPUs[gpuIndex].VRAMUsedMB) / float64(totalFree)
+	return int(float64(target.TotalSizeMB) * vramOverheadPercent / 100 * share)
+}
+
+// computeDraftKVType determines the KV cache type for the draft model.
+// Prefers the same type as the target for consistency, falls back to q4_0
+// if the draft model is too large for q8_0 on the selected GPU.
+func computeDraftKVType(caps *detect.Capabilities, draftInfo *gguf.Info) string {
+	if draftInfo == nil || len(caps.GPUs) == 0 {
+		return "q4_0"
+	}
+
+	// For draft models (typically < 2GB), q8_0 KV cache is fine
+	// on any GPU with > 4GB free. Use q4_0 on smaller GPUs.
+	for _, g := range caps.GPUs {
+		if g.VRAMTotalMB-g.VRAMUsedMB > 4096 {
+			return "q8_0"
+		}
+	}
+	return "q4_0"
+}
+
+// DraftFlags returns the llama-server arguments for speculative decoding.
+func DraftFlags(cfg *DraftConfig) []string {
+	if cfg == nil || cfg.Type == DraftNone {
+		return nil
+	}
+
+	var flags []string
+	ikDialect := backendSupportsMTP(cfg.BackendTag)
+	draftMaxFlag := "--spec-draft-n-max"
+	pSplitFlag := "--spec-draft-p-split"
+	if ikDialect {
+		pSplitFlag = "--p-split"
+	}
+
+	switch cfg.Type {
+	case DraftModel, DraftEagle3, DraftDFlash:
+		specType := cfg.SpecType
+		if cfg.Type == DraftEagle3 && specType == "" {
+			specType = "eagle3"
+		}
+		if cfg.Type == DraftDFlash && specType == "" {
+			specType = "draft-dflash"
+		}
+		if cfg.Type == DraftModel && ikDialect {
+			if specType == "" {
+				specType = "draft"
+			}
+			flags = append(flags, "--spec-type", specTypeWithNMax(specType, cfg.DraftMax))
+		} else if specType != "" {
+			flags = append(flags, "--spec-type", specType)
+		}
+		if cfg.Path != "" {
+			flags = append(flags, "--model-draft", cfg.Path)
+		}
+		if cfg.DraftGPU >= 0 && cfg.Path != "" {
+			flags = append(flags, "--device-draft", draftDeviceName(cfg.BackendTag, cfg.DraftGPU))
+		}
+		if cfg.GPULayersDraft != "" && !ikDialect {
+			flags = append(flags, "--spec-draft-ngl", cfg.GPULayersDraft)
+		}
+		if cfg.CTXSizeDraft > 0 && (cfg.SupportsDraftCTX || ikDialect) {
+			flags = append(flags, "--ctx-size-draft", fmt.Sprintf("%d", cfg.CTXSizeDraft))
+		}
+		if cfg.KVTypeDraft != "" {
+			flags = append(flags, "--cache-type-k-draft", cfg.KVTypeDraft)
+			flags = append(flags, "--cache-type-v-draft", cfg.KVTypeDraft)
+		}
+		if cfg.ThreadsDraft > 0 {
+			flags = append(flags, "--threads-draft", fmt.Sprintf("%d", cfg.ThreadsDraft))
+		}
+		if cfg.DraftMax > 0 && !(ikDialect && cfg.Type == DraftModel) {
+			flags = append(flags, draftMaxFlag, fmt.Sprintf("%d", cfg.DraftMax))
+		}
+		if cfg.DraftMin > 0 && !ikDialect {
+			flags = append(flags, "--spec-draft-n-min", fmt.Sprintf("%d", cfg.DraftMin))
+		}
+		if cfg.PSplit > 0 {
+			flags = append(flags, pSplitFlag, fmt.Sprintf("%.2f", cfg.PSplit))
+		}
+		if cfg.SpecAutoTune {
+			flags = append(flags, "--spec-autotune")
+		}
+
+	case DraftNgram:
+		specType := cfg.SpecType
+		if specType == "" {
+			specType = ngramSpecType(cfg.BackendTag)
+		}
+		flags = append(flags, "--spec-type", specType)
+		if ikDialect {
+			if cfg.NgramN > 0 {
+				flags = append(flags, "--spec-ngram-size-n", fmt.Sprintf("%d", cfg.NgramN))
+			}
+			if cfg.NgramM > 0 {
+				flags = append(flags, "--spec-ngram-size-m", fmt.Sprintf("%d", cfg.NgramM))
+			}
+			if cfg.NgramMinHits > 0 {
+				flags = append(flags, "--spec-ngram-min-hits", fmt.Sprintf("%d", cfg.NgramMinHits))
+			}
+		} else {
+			switch specType {
+			case "ngram-mod":
+				if cfg.NgramN > 0 {
+					flags = append(flags, "--spec-ngram-mod-n-match", fmt.Sprintf("%d", cfg.NgramN))
+				}
+				if cfg.DraftMin > 0 {
+					flags = append(flags, "--spec-ngram-mod-n-min", fmt.Sprintf("%d", cfg.DraftMin))
+				}
+				if cfg.DraftMax > 0 {
+					flags = append(flags, "--spec-ngram-mod-n-max", fmt.Sprintf("%d", cfg.DraftMax))
+				}
+			case "ngram-map-k4v":
+				if cfg.NgramN > 0 {
+					flags = append(flags, "--spec-ngram-map-k4v-size-n", fmt.Sprintf("%d", cfg.NgramN))
+				}
+				if cfg.NgramM > 0 {
+					flags = append(flags, "--spec-ngram-map-k4v-size-m", fmt.Sprintf("%d", cfg.NgramM))
+				}
+				if cfg.NgramMinHits > 0 {
+					flags = append(flags, "--spec-ngram-map-k4v-min-hits", fmt.Sprintf("%d", cfg.NgramMinHits))
+				}
+				if cfg.DraftMax > 0 {
+					flags = append(flags, draftMaxFlag, fmt.Sprintf("%d", cfg.DraftMax))
+				}
+			default:
+				if cfg.NgramN > 0 {
+					flags = append(flags, "--spec-ngram-map-k-size-n", fmt.Sprintf("%d", cfg.NgramN))
+				}
+				if cfg.NgramM > 0 {
+					flags = append(flags, "--spec-ngram-map-k-size-m", fmt.Sprintf("%d", cfg.NgramM))
+				}
+				if cfg.NgramMinHits > 0 {
+					flags = append(flags, "--spec-ngram-map-k-min-hits", fmt.Sprintf("%d", cfg.NgramMinHits))
+				}
+			}
+		}
+		if cfg.SpecAutoTune {
+			flags = append(flags, "--spec-autotune")
+		}
+
+	case DraftMTP:
+		specType := cfg.SpecType
+		if specType == "" {
+			if ikDialect {
+				specType = "mtp"
+			} else {
+				specType = "draft-mtp"
+			}
+		}
+		if ikDialect {
+			flags = append(flags, "--spec-type", specTypeWithNMax(specType, cfg.DraftMax))
+		} else {
+			flags = append(flags, "--spec-type", specType)
+		}
+		if ikDialect || cfg.MTPFlag {
+			flags = append(flags, "--multi-token-prediction")
+		}
+		if cfg.Path != "" {
+			flags = append(flags, "--model-draft", cfg.Path)
+			if cfg.DraftGPU >= 0 {
+				flags = append(flags, "--device-draft", draftDeviceName(cfg.BackendTag, cfg.DraftGPU))
+			}
+			if cfg.GPULayersDraft != "" && !ikDialect {
+				flags = append(flags, "--spec-draft-ngl", cfg.GPULayersDraft)
+			}
+			if cfg.CTXSizeDraft > 0 && (cfg.SupportsDraftCTX || ikDialect) {
+				flags = append(flags, "--ctx-size-draft", fmt.Sprintf("%d", cfg.CTXSizeDraft))
+			}
+			if cfg.KVTypeDraft != "" {
+				flags = append(flags, "--cache-type-k-draft", cfg.KVTypeDraft, "--cache-type-v-draft", cfg.KVTypeDraft)
+			}
+			if cfg.ThreadsDraft > 0 {
+				flags = append(flags, "--threads-draft", fmt.Sprintf("%d", cfg.ThreadsDraft))
+			}
+		}
+		if cfg.DraftMax > 0 && !ikDialect {
+			flags = append(flags, draftMaxFlag, fmt.Sprintf("%d", cfg.DraftMax))
+		}
+		if cfg.SpecAutoTune {
+			flags = append(flags, "--spec-autotune")
+		}
+	}
+
+	return flags
+}
+
+func specTypeWithNMax(specType string, nMax int) string {
+	if nMax <= 0 || strings.Contains(specType, ":") {
+		return specType
+	}
+	return fmt.Sprintf("%s:n_max=%d", specType, nMax)
+}
+
+func draftDeviceName(backendTag string, gpu int) string {
+	if strings.Contains(strings.ToLower(backendTag), "vulkan") {
+		return fmt.Sprintf("Vulkan%d", gpu)
+	}
+	return fmt.Sprintf("CUDA%d", gpu)
+}
+
+// DraftSummary returns a human-readable summary of the draft strategy.
+func DraftSummary(cfg *DraftConfig) string {
+	if cfg == nil || cfg.Type == DraftNone {
+		return ""
+	}
+	switch cfg.Type {
+	case DraftModel:
+		name := filepath.Base(cfg.Path)
+		return fmt.Sprintf("speculative decoding: draft model %s (GPU%d, ctx=%d)",
+			name, cfg.DraftGPU, cfg.CTXSizeDraft)
+	case DraftEagle3:
+		name := filepath.Base(cfg.Path)
+		return fmt.Sprintf("speculative decoding: EAGLE-3 %s (GPU%d, ctx=%d)",
+			name, cfg.DraftGPU, cfg.CTXSizeDraft)
+	case DraftDFlash:
+		name := filepath.Base(cfg.Path)
+		return fmt.Sprintf("speculative decoding: DFlash %s (GPU%d, ctx=%d)",
+			name, cfg.DraftGPU, cfg.CTXSizeDraft)
+	case DraftNgram:
+		autotune := ""
+		if cfg.SpecAutoTune {
+			autotune = ", autotune"
+		}
+		if cfg.SpecType == "ngram-mod" {
+			return fmt.Sprintf("speculative decoding: ngram-mod (match=%d, min=%d, max=%d%s)",
+				cfg.NgramN, cfg.DraftMin, cfg.DraftMax, autotune)
+		}
+		return fmt.Sprintf("speculative decoding: %s (n=%d, m=%d%s)",
+			cfg.SpecType, cfg.NgramN, cfg.NgramM, autotune)
+	case DraftMTP:
+		if cfg.Path != "" {
+			return fmt.Sprintf("speculative decoding: MTP companion %s (GPU%d, ctx=%d)", filepath.Base(cfg.Path), cfg.DraftGPU, cfg.CTXSizeDraft)
+		}
+		return fmt.Sprintf("speculative decoding: MTP (%s)", cfg.SpecType)
+	default:
+		return "speculative decoding: off"
+	}
+}

@@ -1,0 +1,46 @@
+package placement
+
+import (
+	"testing"
+
+	"github.com/raketenkater/ggrun/pkg/detect"
+)
+
+func TestResolveAutoKVPlacement(t *testing.T) {
+	caps := &detect.Capabilities{GPUs: []detect.GPU{{VRAMTotalMB: 24576}, {VRAMTotalMB: 12288}, {VRAMTotalMB: 12288}}} // 48G
+	cases := []struct {
+		name        string
+		totalSizeMB int
+		kvTotalMB   int
+		isMoE       bool
+		arch        string
+		want        string
+	}{
+		{"dense_fits_vram_gpu", 20000, 4000, false, "llama", "gpu"},
+		{"big_moe_offloads_cpu", 116000, 4000, true, "qwen3moe", "cpu"},
+		{"dense_too_big_still_gpu", 116000, 4000, false, "llama", "gpu"},
+		{"small_moe_fits_gpu", 8000, 4000, true, "qwen3moe", "gpu"},
+		{"small_moe_huge_kv_offloads_cpu", 8000, 50000, true, "qwen3moe", "cpu"},
+		// deepseek4 without flash attention grows compute scratch with real
+		// token position (~98 KiB/token measured) — KV must stay on GPU so FA
+		// stays enabled, even for a big offloading MoE.
+		{"deepseek4_big_moe_keeps_kv_gpu", 140000, 16000, true, "deepseek4", "gpu"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &ModelProfile{IsMoE: tc.isMoE, ModelArch: tc.arch}
+			// Set realistic NonExpertBytes so the MoE KV placement check
+			// uses real data instead of the 10% fallback. A 116 GB MoE
+			// with 45 GB non-expert (attention, norms, embeddings) cannot
+			// fit non-expert + KV in 49 GB VRAM → KV goes to CPU.
+			if tc.isMoE && tc.totalSizeMB > 50000 {
+				m.NonExpertBytes = int64(tc.totalSizeMB) * 1024 * 1024 * 39 / 100
+			}
+			// derived per-component overhead: no CUDA probe data here, so only compute buffer is charged
+			const vramOverheadMB = 3 * computeFloorMB
+			if got := resolveAutoKVPlacement(caps, m, tc.totalSizeMB, tc.kvTotalMB, vramOverheadMB); got != tc.want {
+				t.Fatalf("resolveAutoKVPlacement(%dMB, moe=%v, arch=%s) = %q, want %q", tc.totalSizeMB, tc.isMoE, tc.arch, got, tc.want)
+			}
+		})
+	}
+}
