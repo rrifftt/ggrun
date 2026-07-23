@@ -36,6 +36,17 @@ type specTestReport struct {
 }
 
 func cmdSpecTest(args []string) {
+	// Catch usage errors here so they exit 2 (like dry-run/tune/kv-probe),
+	// not 1. runSpecTest keeps its own guards as a safety net.
+	req, err := parseLaunchArgs(args)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(2)
+	}
+	if req.ModelPath == "" {
+		fmt.Fprintln(os.Stderr, "Usage: ggrun spec-test <model.gguf> [--rounds 2] [--ctx 1048576] [--parallel 4]")
+		os.Exit(2)
+	}
 	if err := runSpecTest(args); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
