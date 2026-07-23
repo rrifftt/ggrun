@@ -2605,9 +2605,6 @@ func cmdTune(args []string) {
 		PredictOOM: func(flags []string) bool {
 			fm := placement.ParseFlagsToMap(flags)
 			needed, free := placement.PredictVRAMUsage(model, fm, caps)
-			fmt.Printf("[PredictOOM] needed=%d free=%d oom=%v ncpuMoe=%s totalMB=%d expertB=%d nonExpertB=%d layers=%d\n",
-				needed, free, needed > free, fm["--n-cpu-moe"],
-				model.TotalSizeMB, model.ExpertBytes, model.NonExpertBytes, model.NumLayers)
 			return needed > free
 		},
 		Cache:            cache,
