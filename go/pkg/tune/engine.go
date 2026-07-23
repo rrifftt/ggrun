@@ -137,6 +137,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	crashedFlagSets := []map[string]interface{}{}
 
 	planIndex := 0
+	consecutiveWasted := 0 // tracks rounds that produced no useful candidate
 	for round := 1; round <= e.Rounds; {
 		if e.OnProgress != nil {
 			e.OnProgress(fmt.Sprintf("AI-tune: round %d/%d (best %.1f tok/s)", round, e.Rounds, best.Result.GenTPS))
@@ -215,12 +216,26 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				if e.OnProgress != nil {
 					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q duplicates an earlier flag set", suggestion.Name))
 				}
+				consecutiveWasted++
+				if consecutiveWasted >= 3 {
+					if e.OnProgress != nil {
+						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
+					}
+					break
+				}
 				round++
 				continue
 			}
 			if isSkippedDueToOOM(overrides, crashedFlagSets, initialFlags) {
 				if e.OnProgress != nil {
 					e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q due to predicted OOM", suggestion.Name))
+				}
+				consecutiveWasted++
+				if consecutiveWasted >= 3 {
+					if e.OnProgress != nil {
+						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
+					}
+					break
 				}
 				round++
 				continue
@@ -229,6 +244,13 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			if equalFlags(initialFlags, candidateFlags) {
 				if e.OnProgress != nil {
 					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q made no effective flag changes", suggestion.Name))
+				}
+				consecutiveWasted++
+				if consecutiveWasted >= 3 {
+					if e.OnProgress != nil {
+						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
+					}
+					break
 				}
 				round++
 				continue
@@ -346,7 +368,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				}
 			}
 		}
-
+		
 		e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
 		round++
 	}
@@ -1277,6 +1299,23 @@ func refinementPlan(baseFlags []string, backend string, caps *detect.Capabilitie
 		}
 		if caps.CPU.Threads > caps.CPU.Cores && atoiDefault(base["--threads-batch"], 0) != caps.CPU.Threads {
 			add("ref-threads-batch-logical", map[string]interface{}{"--threads-batch": fmt.Sprintf("%d", caps.CPU.Threads)}, "refine: logical threads for prefill")
+		}
+	}
+
+	// Combination candidates: pair batch and ubatch knobs that each
+	// showed promise individually. They reduce different bottlenecks
+	// (prefill vs decode) and can stack for +1-2 tok/s.
+	if isMoEOffload {
+		if batch > 1024 && ubatch > 384 {
+			add("ref-moe-batch-ubatch",
+				map[string]interface{}{"-b": fmt.Sprintf("%d", maxInt(batch/2, 1024)), "-ub": "384"},
+				"refine: combine lower batch + moderate ubatch for MoE")
+		}
+	} else {
+		if batch > 0 && batch < 8192 && ubatch > 256 {
+			add("ref-batch-up-ubatch-down",
+				map[string]interface{}{"-b": fmt.Sprintf("%d", minInt(batch*2, 8192)), "-ub": fmt.Sprintf("%d", maxInt(ubatch/2, 256))},
+				"refine: larger batch + smaller ubatch for prefill/decode balance")
 		}
 	}
 
