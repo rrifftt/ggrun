@@ -1432,6 +1432,15 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		s.NCPUMoE = layersCPU
 	}
 
+	// MoE models with CPU-resident experts benefit from --no-mmap.
+	// mmap causes page faults on every expert access during decode,
+	// which dominates latency. Pre-loading experts into RAM gives 2-3x
+	// speedup (measured: 20.8 → 46.1 tok/s on Qwen3.6-28B REAP20).
+	// The tune engine's moe-mmap candidate can re-enable it if beneficial.
+	if s.NCPUMoE > 0 {
+		s.MMap = false
+	}
+
 	_ = nonExpertPerLayerMB
 	return s, nil
 }
