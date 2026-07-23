@@ -9,8 +9,8 @@ import (
 
 func TestDefaults(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Port != 8081 {
-		t.Fatalf("expected port 8081, got %d", cfg.Port)
+	if cfg.Port != 8080 {
+		t.Fatalf("expected port 8080, got %d", cfg.Port)
 	}
 	if cfg.ModelDir == "" {
 		t.Fatalf("model dir should not be empty")

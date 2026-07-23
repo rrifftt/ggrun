@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/gguf"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/gguf"
 )
 
 // ContextEstimate holds max and fit context sizes for a model.

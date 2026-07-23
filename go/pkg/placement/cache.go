@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 // CacheEntry holds a validated placement cache entry for MoE.

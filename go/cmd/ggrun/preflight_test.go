@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/placement"
 )
 
 func TestFindFitParamsDoesNotCrossCustomForksViaPATH(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/placement"
 )
 
 // Launch preflight: before paying a real model load (15+ minutes for a big MoE

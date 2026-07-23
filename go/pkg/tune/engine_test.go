@@ -3,7 +3,7 @@ package tune
 import (
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/benchmark"
+	"github.com/rrifftt/ggrun/pkg/benchmark"
 )
 
 // ---------------------------------------------------------------------------

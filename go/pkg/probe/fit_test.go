@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/gguf"
+	"github.com/rrifftt/ggrun/pkg/gguf"
 )
 
 func TestEstimateFitCtxForInfoUsesExistingMetadata(t *testing.T) {

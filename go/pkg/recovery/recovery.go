@@ -18,9 +18,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/placement"
-	"github.com/raketenkater/ggrun/pkg/server"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/server"
 )
 
 // FailureType classifies how a server load failed.
@@ -69,8 +69,8 @@ type Launcher struct {
 	OnPromote     func(logPath string, args []string) ([]string, bool)
 
 	// Quiet keeps the backend's stdout out of the terminal (it still goes to the
-	// per-run log file). Used by Claude Code mode, where ggrun hands the terminal
-	// to the `claude` client and backend logs must not bleed into its UI.
+	// per-run log file). Used when ggrun hands the terminal to a foreground
+	// client so backend logs don't bleed into its UI.
 	Quiet bool
 
 	// LogPath, if set, is where the backend log is written (a stable, discoverable

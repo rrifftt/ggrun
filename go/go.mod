@@ -1,4 +1,4 @@
-module github.com/raketenkater/ggrun
+module github.com/rrifftt/ggrun
 
 go 1.24.13
 

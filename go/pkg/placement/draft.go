@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/gguf"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/gguf"
 )
 
 // DraftType selects the speculative decoding strategy.

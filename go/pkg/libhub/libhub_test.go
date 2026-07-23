@@ -1,6 +1,7 @@
 package libhub
 
 import (
+	"runtime"
 	"os"
 	"path/filepath"
 	"testing"
@@ -18,6 +19,9 @@ func touch(t *testing.T, path string) {
 
 // A flat release bundle: thin binary + co-located .so, not under a build/ dir.
 func TestSetupFlatBundle(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("libhub targets Linux shared libraries (.so / LD_LIBRARY_PATH)")
+	}
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "llama-server")
 	touch(t, bin)
@@ -39,6 +43,9 @@ func TestSetupFlatBundle(t *testing.T) {
 // The real ggrun layout: .bin/llama-server-cuda is a SYMLINK into a build tree
 // whose libs sit beside the binary (build/bin). Setup must resolve the symlink.
 func TestSetupResolvesSymlinkToColocatedLibs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on Windows")
+	}
 	root := t.TempDir()
 	realBinDir := filepath.Join(root, "src", "build-cuda", "bin")
 	realBin := filepath.Join(realBinDir, "llama-server")
@@ -65,6 +72,9 @@ func TestSetupResolvesSymlinkToColocatedLibs(t *testing.T) {
 }
 
 func TestSetupFindsScatteredLibrariesInNamedBuildDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("libhub targets Linux shared libraries (.so / LD_LIBRARY_PATH)")
+	}
 	root := t.TempDir()
 	bin := filepath.Join(root, "src", "build-cuda", "bin", "llama-server")
 	lib := filepath.Join(root, "src", "build-cuda", "common", "libmtmd.so")

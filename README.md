@@ -29,7 +29,7 @@ Discovered via `ggrun tune` on an RTX 3070 (8 GB) + Ryzen 7 5800X:
 - **VRAM predictor**: pre-launch OOM prediction skips doomed candidates instantly
 - **OOM recovery**: detects CUDA OOM, re-plans with fewer GPU layers, retries
 - **Speculative decoding**: MTP, EAGLE3, n-gram, draft model profiles
-- **Vision/multimodal**, **Claude Code integration**, **community tune sharing**
+- **Vision/multimodal**, **community tune sharing**
 - **Cross-platform**: Windows, Linux, macOS
 
 ## Build

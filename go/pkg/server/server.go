@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/libhub"
+	"github.com/rrifftt/ggrun/pkg/libhub"
 )
 
 // Process wraps a running llama-server subprocess.
@@ -81,9 +81,9 @@ func StartWithTimeout(args []string, port int, timeout time.Duration) (*Process,
 }
 
 // StartWithTimeoutTo is StartWithTimeout but streams the backend's ongoing logs
-// to termOut/termErr instead of os.Stdout/os.Stderr. claude-code mode passes a
-// log file here so the backend's per-request log spam doesn't bleed into Claude
-// Code's terminal UI once ggrun hands the terminal to the `claude` client.
+// to termOut/termErr instead of os.Stdout/os.Stderr. Callers can pass a
+// log file here so the backend's per-request log spam doesn't bleed into the
+// terminal UI of a foreground client.
 func StartWithTimeoutTo(args []string, port int, timeout time.Duration, termOut, termErr io.Writer) (*Process, error) {
 	return StartWithTimeoutToEnv(args, port, timeout, termOut, termErr, nil)
 }

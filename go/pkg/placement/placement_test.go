@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 // ---------------------------------------------------------------------------
@@ -49,19 +49,18 @@ func argsContainPair(args []string, flag, value string) bool {
 
 func TestArgs_FlashAttnConditional(t *testing.T) {
 	s := baseStrategy()
-
 	// FlashAttention = true → "--flash-attn", "on" present
 	s.FlashAttention = true
 	args := s.Args("/models/test.gguf", 8080)
 	if !argsContainPair(args, "--flash-attn", "on") {
 		t.Errorf("expected --flash-attn on when FlashAttention=true, got: %v", args)
 	}
-
-	// FlashAttention = false → absent
+	// FlashAttention = false AND KVPlacement = "cpu" → absent
 	s.FlashAttention = false
+	s.KVPlacement = "cpu"
 	args = s.Args("/models/test.gguf", 8080)
 	if argsContain(args, "--flash-attn") {
-		t.Errorf("expected no --flash-attn when FlashAttention=false, got: %v", args)
+		t.Errorf("expected no --flash-attn when FlashAttention=false and KVPlacement=cpu, got: %v", args)
 	}
 }
 
@@ -247,13 +246,6 @@ func TestArgs_HasSSM(t *testing.T) {
 	}
 }
 
-func TestArgs_TimeoutAlwaysEmitted(t *testing.T) {
-	s := baseStrategy()
-	args := s.Args("/models/test.gguf", 8080)
-	if !argsContainPair(args, "--timeout", "2147483647") {
-		t.Errorf("expected --timeout 2147483647, got: %v", args)
-	}
-}
 
 func TestArgs_OTStringEmitted(t *testing.T) {
 	s := baseStrategy()

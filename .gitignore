@@ -35,3 +35,5 @@ go/bin/
 go/cmd/ggrun/dryrun_
 go/cmd/ggrun/tune_
 
+# Git hook samples
+*.sample

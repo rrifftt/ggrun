@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/backends"
-	"github.com/raketenkater/ggrun/pkg/config"
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/backends"
+	"github.com/rrifftt/ggrun/pkg/config"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/placement"
 )
 
 func writeFakeBackend(t *testing.T, name, body string) string {
@@ -23,31 +23,6 @@ func writeFakeBackend(t *testing.T, name, body string) string {
 		t.Fatal(err)
 	}
 	return path
-}
-
-func TestClaudeCodeParallelIsFeaturePolicyForDeepseek4(t *testing.T) {
-	req := &launchRequest{ClaudeCode: true}
-	model := &placement.ModelProfile{ModelArch: "deepseek4", CTXTrain: 1048576}
-	be := &backendInfo{Tag: "llama"}
-	opts := placementOptionsFromRequest(req, model, be, t.TempDir())
-	if opts.Parallel != 4 {
-		t.Fatalf("claude-code should request four slots over the shared mainline placement, got %d", opts.Parallel)
-	}
-	if opts.ContextSize != 1048576 {
-		t.Fatalf("claude-code auto context should use the 1M native window, got %d", opts.ContextSize)
-	}
-	explicit := &launchRequest{ClaudeCode: true, CtxFlag: "262144"}
-	if got := placementOptionsFromRequest(explicit, model, be, t.TempDir()).ContextSize; got != 262144 {
-		t.Fatalf("explicit Claude Code context must win, got %d", got)
-	}
-	be = &backendInfo{Tag: "ik_llama"}
-	opts = placementOptionsFromRequest(req, &placement.ModelProfile{ModelArch: "qwen3moe"}, be, t.TempDir())
-	if opts.Parallel != 4 {
-		t.Fatalf("claude-code on other models initially requests 4 slots, got %d", opts.Parallel)
-	}
-	if opts.ContextSize != 131072 {
-		t.Fatalf("unknown model context should use the portable 2x64k baseline, got %d", opts.ContextSize)
-	}
 }
 
 func TestParseLaunchArgsPlansDirectKVTypeOnce(t *testing.T) {
@@ -176,22 +151,6 @@ func TestRuntimeLogCUDAOOMPrefersExactAllocation(t *testing.T) {
 		t.Fatalf("exact OOM = device %d reserve %d estimated=%v ok=%v", device, reserveMB, estimated, ok)
 	}
 }
-
-func TestPreviousClaudeLogMatchesRuntimeShape(t *testing.T) {
-	model := &placement.ModelProfile{Path: "/models/DeepSeek-V4-00001-of-00004.gguf"}
-	strategy := &placement.Strategy{ContextSize: 1048576, Parallel: 4}
-	log := "loading model '/models/DeepSeek-V4-00001-of-00004.gguf'\n" +
-		"initializing, n_slots = 4, n_ctx_slot = 262144, kv_unified = 'false'\n" +
-		"[launch] health check OK after 5m1s\n"
-	if !previousClaudeLogMatches(log, model, strategy) {
-		t.Fatal("matching previous Claude runtime log was rejected")
-	}
-	strategy.Parallel = 8
-	if previousClaudeLogMatches(log, model, strategy) {
-		t.Fatal("log from a different parallel/context shape must not be recovered")
-	}
-}
-
 func TestStartupComputeMeasurementMustMatchFailedGPU(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.CacheDir = t.TempDir()
@@ -422,14 +381,6 @@ func TestAutoStartupTimeoutDoublesBaseTimeout(t *testing.T) {
 	}
 }
 
-func TestKnownCommandAcceptsUpdateAlias(t *testing.T) {
-	if !knownCommand("update") {
-		t.Fatal("expected update command to be known")
-	}
-	if !knownCommand("--update") {
-		t.Fatal("expected legacy --update alias to be known")
-	}
-}
 
 func TestResolveCtxFlag(t *testing.T) {
 	if got := resolveCtxFlag("fit", 131072); got != 0 {
@@ -491,6 +442,9 @@ func TestSelectBackendBackendFlagOverridesConfiguredServerBin(t *testing.T) {
 }
 
 func TestSelectBackendExplicitServerBinWins(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake-backend probe uses a shell script")
+	}
 	dir := t.TempDir()
 	ikPath := filepath.Join(dir, "ik-llama-server")
 	vulkanPath := filepath.Join(dir, "vulkan-llama-server")
@@ -816,316 +770,14 @@ func TestRuntimeGPUCapabilitiesMatchesVisibilityRenumbering(t *testing.T) {
 	}
 }
 
-func TestClaudeCodeAutocompactPct(t *testing.T) {
-	cases := []struct {
-		name string
-		args []string
-		want int
-	}{
-		{"parallel4_65k_slot", []string{"--ctx-size", "262144", "--parallel", "4"}, 24},
-		{"parallel8_32k_slot", []string{"--ctx-size", "262144", "--parallel", "8"}, 12},
-		{"parallel1_full_ctx_caps_at_90", []string{"--ctx-size", "262144", "--parallel", "1"}, 90},
-		{"no_parallel_defaults_to_1", []string{"--ctx-size", "65536"}, 24},
-		{"tiny_slot_floors_at_5", []string{"--ctx-size", "8192", "--parallel", "8"}, 5},
-		{"missing_ctx_keeps_legacy_default", []string{"--parallel", "4"}, 25},
-		{"short_ctx_alias", []string{"-c", "131072", "-np", "4"}, 12},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := claudeCodeAutocompactPct(tc.args); got != tc.want {
-				t.Fatalf("claudeCodeAutocompactPct(%v) = %d, want %d", tc.args, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestArgIntValue(t *testing.T) {
-	args := []string{"-m", "model.gguf", "--ctx-size", "4096", "--parallel", "4", "--flag"}
-	if got := argIntValue(args, "--ctx-size", "-c"); got != 4096 {
-		t.Fatalf("--ctx-size = %d, want 4096", got)
-	}
-	if got := argIntValue(args, "--parallel", "-np"); got != 4 {
-		t.Fatalf("--parallel = %d, want 4", got)
-	}
-	if got := argIntValue(args, "--missing"); got != -1 {
-		t.Fatalf("--missing = %d, want -1", got)
-	}
-	// trailing flag with no value must not panic or misparse
-	if got := argIntValue(args, "--flag"); got != -1 {
-		t.Fatalf("--flag (no value) = %d, want -1", got)
-	}
-	// last-wins: a user value appended after the strategy's must override it, to
-	// mirror llama.cpp/ik_llama (which honor the final repeated flag).
-	dup := []string{"--ctx-size", "262144", "--parallel", "4", "--ctx-size", "16384"}
-	if got := argIntValue(dup, "--ctx-size", "-c"); got != 16384 {
-		t.Fatalf("last-wins --ctx-size = %d, want 16384", got)
-	}
-	// an unparseable later value is skipped, falling back to the last parseable one
-	if got := argIntValue([]string{"--ctx-size", "8192", "--ctx-size", "max"}, "--ctx-size"); got != 8192 {
-		t.Fatalf("last parseable --ctx-size = %d, want 8192", got)
-	}
-}
-
-func TestClaudeCodeAutocompactPctLastWinsOnUserOverride(t *testing.T) {
-	// strategy emits 262144/4 (pct 24); a user appends --ctx-size 16384 (backend
-	// last-wins → 16384/4 = 4096 slot → pct floors at 5). Must reflect the real slot.
-	args := []string{"--ctx-size", "262144", "--parallel", "4", "--ctx-size", "16384"}
-	if got := claudeCodeAutocompactPct(args); got != 5 {
-		t.Fatalf("autocompact pct with user override = %d, want 5", got)
-	}
-}
-
-func TestClaudeCodeSearchMCPArgsRespectsUserConfig(t *testing.T) {
-	if got := claudeCodeSearchMCPArgs([]string{"--mcp-config", "mine.json"}); got != nil {
-		t.Fatalf("expected nil when user passed --mcp-config, got %v", got)
-	}
-}
-
-func TestClaudeCodeSearchMCPArgsEnablesResearchTools(t *testing.T) {
-	binDir := t.TempDir()
-	uvx := filepath.Join(binDir, "uvx")
-	if err := os.WriteFile(uvx, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", binDir)
-
-	got := claudeCodeSearchMCPArgs(nil)
-	joined := strings.Join(got, " ")
-	for _, want := range []string{"--mcp-config", "duckduckgo-mcp-server", "--allowedTools", "mcp__ddg-search__search", "mcp__ddg-search__fetch_content"} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("missing %q in research MCP args: %v", want, got)
-		}
-	}
-
-	got = claudeCodeSearchMCPArgs([]string{"--allowed-tools", "mine"})
-	if hasArg(got, "--allowedTools") || hasArg(got, "--allowed-tools") {
-		t.Fatalf("user allowed-tools must not be overridden, got %v", got)
-	}
-}
-
-func TestClaudeCodePermissionArgsDefaultsToLocalAuto(t *testing.T) {
-	t.Setenv("GGRUN_CLAUDE_PERMISSION_MODE", "")
-	got := claudeCodePermissionArgs(nil)
-	if len(got) != 2 || got[0] != "--permission-mode" || got[1] != "auto" {
-		t.Fatalf("local Claude launch must use the routed Auto reviewer, got %v", got)
-	}
-}
-
-func TestClaudeCodePermissionArgsRespectsOverrides(t *testing.T) {
-	t.Setenv("GGRUN_CLAUDE_PERMISSION_MODE", "auto")
-	if got := claudeCodePermissionArgs(nil); len(got) != 2 || got[1] != "auto" {
-		t.Fatalf("environment override not respected: %v", got)
-	}
-	if got := claudeCodePermissionArgs([]string{"--permission-mode", "plan"}); got != nil {
-		t.Fatalf("explicit CLI mode must win, got %v", got)
-	}
-	if got := claudeCodePermissionArgs([]string{"--permission-mode=manual"}); got != nil {
-		t.Fatalf("explicit equals-form CLI mode must win, got %v", got)
-	}
-	t.Setenv("GGRUN_CLAUDE_PERMISSION_MODE", "inherit")
-	if got := claudeCodePermissionArgs(nil); got != nil {
-		t.Fatalf("inherit must preserve settings.json mode, got %v", got)
-	}
-	t.Setenv("GGRUN_CLAUDE_PERMISSION_MODE", "not-a-mode")
-	if got := claudeCodePermissionArgs(nil); len(got) != 2 || got[1] != "auto" {
-		t.Fatalf("invalid override must fail safe to routed Auto, got %v", got)
-	}
-}
-
-func TestClaudeCodeAliasArgs(t *testing.T) {
-	base := []string{"-m", "model.gguf", "--port", "8081"}
-	// claude-code mode appends --alias local so /v1/models advertises "local"
-	got := claudeCodeAliasArgs(base, true)
-	if argIndexOf(got, "--alias") < 0 || got[argIndexOf(got, "--alias")+1] != "local" {
-		t.Fatalf("expected --alias local appended, got %v", got)
-	}
-	// non-claude-code mode is a no-op
-	if got := claudeCodeAliasArgs(base, false); len(got) != len(base) {
-		t.Fatalf("expected no change outside claude-code mode, got %v", got)
-	}
-	// a user-set alias is respected (not doubled)
-	user := []string{"-m", "model.gguf", "--alias", "mymodel"}
-	if got := claudeCodeAliasArgs(user, true); len(got) != len(user) {
-		t.Fatalf("expected user --alias preserved without doubling, got %v", got)
-	}
-	if got := claudeCodeAliasArgs([]string{"-a", "x"}, true); len(got) != 2 {
-		t.Fatalf("expected short -a alias respected, got %v", got)
-	}
-}
-
-func TestClaudeCodeCacheArgs(t *testing.T) {
-	base := []string{"llama-server", "-m", "model.gguf"}
-	got := claudeCodeCacheArgs(base, true, "--cache-prompt --cache-reuse N", true)
-	if !hasArgValue(got, "--cache-reuse", "256") {
-		t.Fatalf("expected Claude cache reuse default, got %v", got)
-	}
-	if got := claudeCodeCacheArgs(base, false, "--cache-reuse N", true); len(got) != len(base) {
-		t.Fatalf("expected no cache change outside Claude mode, got %v", got)
-	}
-	if got := claudeCodeCacheArgs(base, true, "--cache-prompt", true); len(got) != len(base) {
-		t.Fatalf("expected unsupported backend to remain unchanged, got %v", got)
-	}
-	if got := claudeCodeCacheArgs(base, true, "--cache-reuse N", false); len(got) != len(base) {
-		t.Fatalf("expected recurrent context to skip unsupported cache shifting, got %v", got)
-	}
-	for _, user := range [][]string{
-		{"llama-server", "--cache-reuse", "0"},
-		{"llama-server", "--cache-reuse=0"},
-		{"llama-server", "--no-cache-prompt"},
-	} {
-		got := claudeCodeCacheArgs(user, true, "--cache-reuse N", true)
-		if len(got) != len(user) {
-			t.Fatalf("expected user cache override preserved, input %v got %v", user, got)
-		}
-	}
-}
-
-func argIndexOf(args []string, want string) int {
-	for i, a := range args {
-		if a == want {
-			return i
-		}
-	}
-	return -1
-}
-
-func TestClaudeCodeEnvDisablesIdleTimeoutForLocalBackend(t *testing.T) {
-	t.Setenv("ANTHROPIC_API_KEY", "real-key")
-	t.Setenv("API_TIMEOUT_MS", "")
-	t.Setenv("API_FORCE_IDLE_TIMEOUT", "")
-	t.Setenv("CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS", "")
-	t.Setenv("CLAUDE_ENABLE_BYTE_WATCHDOG", "")
-	t.Setenv("CLAUDE_ENABLE_STREAM_WATCHDOG", "")
-	t.Setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "")
-	env := claudeCodeEnv("0.0.0.0", 8081, []string{"llama-server", "--ctx-size", "1048576", "--parallel", "4"})
-
-	if envHasPrefix(env, "ANTHROPIC_API_KEY=") {
-		t.Fatalf("claude-code env must drop real ANTHROPIC_API_KEY: %v", env)
-	}
-	for _, want := range []string{
-		"ANTHROPIC_BASE_URL=http://127.0.0.1:8081",
-		"API_TIMEOUT_MS=2147483647",
-		"API_FORCE_IDLE_TIMEOUT=0",
-		"CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=2147483647",
-		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
-		"CLAUDE_ENABLE_STREAM_WATCHDOG=0",
-	} {
-		if !envContains(env, want) {
-			t.Fatalf("missing %s in claude-code env: %v", want, env)
-		}
-	}
-}
-
-func envContains(env []string, want string) bool {
-	for _, kv := range env {
-		if kv == want {
-			return true
-		}
-	}
-	return false
-}
-
-func envHasPrefix(env []string, prefix string) bool {
-	for _, kv := range env {
-		if strings.HasPrefix(kv, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func TestClaudeCodeSlotAdjust(t *testing.T) {
-	cases := []struct {
-		name         string
-		ctx, par     int
-		claudeCode   bool
-		explicit     bool
-		wantParallel int
-	}{
-		{"large_ctx_keeps_4", 262144, 4, true, false, 4},
-		{"fit_32k_drops_to_1", 32768, 4, true, false, 1}, // the MiniMax-M3 regression: 8k slots
-		{"128k_drops_to_2", 131072, 4, true, false, 2},   // 65k slots
-		{"tiny_ctx_floors_at_1", 8192, 4, true, false, 1},
-		{"not_claude_mode_untouched", 32768, 4, false, false, 4},
-		{"parallel_1_untouched", 32768, 1, true, false, 1},
-		{"explicit_parallel_kept", 65536, 2, true, true, 2}, // user tuning a big MoE: 2x32k slots
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			s := &placement.Strategy{ContextSize: tc.ctx, Parallel: tc.par}
-			claudeCodeSlotAdjust(s, tc.claudeCode, tc.explicit)
-			if s.Parallel != tc.wantParallel {
-				t.Fatalf("ctx=%d par=%d cc=%v: got parallel %d, want %d", tc.ctx, tc.par, tc.claudeCode, s.Parallel, tc.wantParallel)
-			}
-		})
-	}
-}
-
-func TestClaudeCodeHybridUsesFairPromptBatch(t *testing.T) {
-	s := &placement.Strategy{ContextSize: 1048576, Parallel: 2, BatchSize: 2048, HasSSM: true}
-	claudeCodeSlotAdjust(s, true, false)
-	if s.BatchSize != claudeHybridBatch {
-		t.Fatalf("hybrid Claude batch=%d, want %d", s.BatchSize, claudeHybridBatch)
-	}
-
-	nonClaude := &placement.Strategy{ContextSize: 1048576, Parallel: 2, BatchSize: 2048, HasSSM: true}
-	claudeCodeSlotAdjust(nonClaude, false, false)
-	if nonClaude.BatchSize != 2048 {
-		t.Fatalf("non-Claude batch was changed: %d", nonClaude.BatchSize)
-	}
-}
-
-func TestClaudeCodeSamplingArgs(t *testing.T) {
-	base := []string{"-m", "model.gguf"}
-	got := claudeCodeSamplingArgs(base, true, nil)
-	for _, want := range []string{"--presence-penalty", "--repeat-penalty", "--repeat-last-n", "--top-k", "--top-p", "--min-p"} {
-		if !hasArg(got, want) {
-			t.Fatalf("expected %s in claude-code sampling defaults, got %v", want, got)
-		}
-	}
-	// non-claude-code: untouched
-	if got := claudeCodeSamplingArgs(base, false, nil); len(got) != len(base) {
-		t.Fatalf("expected no sampling flags outside claude-code mode, got %v", got)
-	}
-	// user-set flag wins: not doubled, others still added
-	user := []string{"-m", "model.gguf", "--presence-penalty", "1.5"}
-	got = claudeCodeSamplingArgs(user, true, nil)
-	n := 0
-	for _, a := range got {
-		if a == "--presence-penalty" {
-			n++
-		}
-	}
-	if n != 1 || !hasArg(got, "--top-k") {
-		t.Fatalf("expected user presence-penalty kept once + other defaults added, got %v", got)
-	}
-}
-
-func TestClaudeCodeSamplingArgsDeepSeek4(t *testing.T) {
-	base := []string{"-m", "model.gguf"}
-	model := &placement.ModelProfile{ModelArch: "deepseek4"}
-	got := claudeCodeSamplingArgs(base, true, model)
-	for _, want := range []string{"--temp", "--top-k", "--top-p", "--min-p", "--reasoning-budget"} {
-		if !hasArg(got, want) {
-			t.Fatalf("expected %s in deepseek4 claude-code defaults, got %v", want, got)
-		}
-	}
-	if got[argIndexOf(got, "--top-k")+1] != "40" || got[argIndexOf(got, "--min-p")+1] != "0.05" || got[argIndexOf(got, "--reasoning-budget")+1] != "0" {
-		t.Fatalf("unexpected deepseek4 defaults: %v", got)
-	}
-
-	user := []string{"-m", "model.gguf", "--reasoning-budget", "-1", "--top-k", "10"}
-	got = claudeCodeSamplingArgs(user, true, model)
-	if got[argIndexOf(got, "--reasoning-budget")+1] != "-1" || got[argIndexOf(got, "--top-k")+1] != "10" {
-		t.Fatalf("user deepseek4 sampling overrides should win, got %v", got)
-	}
-}
-
 // A models dir full of symlinks (e.g. shards linked from another disk) must be
 // sized via the link targets. Summing entry.Info() (lstat) once shrank a 146GB
 // sharded model to 365 bytes; the parseModel drift-rescale then crushed
 // ExpertBytes with it and placement pinned all expert layers onto one GPU.
 func TestTotalModelSizeFollowsSymlinkedShards(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink creation requires elevated privileges on Windows")
+	}
 	realDir := t.TempDir()
 	linkDir := t.TempDir()
 	var want int64

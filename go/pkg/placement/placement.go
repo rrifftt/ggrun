@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 // VRAM and compute sizing constants
@@ -469,8 +469,8 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			// The caller's requested slot count wins over what happened to be
 			// cached: parallel shapes slots and compute buffers, not the weight
 			// layout the cache exists to remember. Without this, a placement
-			// cached by a --parallel 1 CLI run silently stripped Claude Code
-			// mode down to a single slot.
+			// cached by a --parallel 1 CLI run would silently strip a multi-slot
+			// launch down to a single slot.
 			if opts.Parallel > 0 && opts.Parallel != cache.Parallel {
 				s.Parallel = opts.Parallel
 			}
@@ -1960,13 +1960,13 @@ func buildOTStringFromStart(layersPerGPU []int, gpus []detect.GPU, gpuOrder []in
 			for l := start; l <= last; l++ {
 				layerParts = append(layerParts, fmt.Sprintf("%d", l))
 			}
-			layerRange := stringsJoin(layerParts, "|")
+			layerRange := strings.Join(layerParts, "|")
 			parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, layerRange, expertTensorPattern, deviceName(backendTag, cudaIdx)))
 			nextLayer += count
 		}
 	}
 	parts = append(parts, "exps=CPU")
-	return stringsJoin(parts, ",")
+	return strings.Join(parts, ",")
 }
 
 // subExpertPin pins one MoE layer's gate+up expert projections (2/3 of the
@@ -2041,7 +2041,7 @@ func buildOTStringWithSubPins(layersPerGPU []int, subPins []subExpertPin, gpus [
 			for l := start; l <= last; l++ {
 				layerParts = append(layerParts, fmt.Sprintf("%d", l))
 			}
-			parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, stringsJoin(layerParts, "|"), expertTensorPattern, deviceName(backendTag, gpus[gi].Index)))
+			parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, strings.Join(layerParts, "|"), expertTensorPattern, deviceName(backendTag, gpus[gi].Index)))
 			nextLayer += count
 		}
 	}
@@ -2062,12 +2062,12 @@ func buildOTStringWithSubPins(layersPerGPU []int, subPins []subExpertPin, gpus [
 			for _, l := range byGPU[gi] {
 				layerParts = append(layerParts, fmt.Sprintf("%d", l))
 			}
-			parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, stringsJoin(layerParts, "|"), gateUpPattern, deviceName(backendTag, gpus[gi].Index)))
+			parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, strings.Join(layerParts, "|"), gateUpPattern, deviceName(backendTag, gpus[gi].Index)))
 		}
 	}
 
 	parts = append(parts, "exps=CPU")
-	return stringsJoin(parts, ",")
+	return strings.Join(parts, ",")
 }
 
 func buildOTStringFromAssignments(assignments []GPUAssignment, gpus []detect.GPU, numLayers int, backendTag string) string {
@@ -2091,12 +2091,12 @@ func buildOTStringFromAssignments(assignments []GPUAssignment, gpus []detect.GPU
 		for l := start; l <= last; l++ {
 			layerParts = append(layerParts, fmt.Sprintf("%d", l))
 		}
-		layerRange := stringsJoin(layerParts, "|")
+		layerRange := strings.Join(layerParts, "|")
 		parts = append(parts, fmt.Sprintf(`blk\.(%s)\.%s.*=%s`, layerRange, expertTensorPattern, deviceName(backendTag, assign.CUDAIndex)))
 		nextLayer += assign.Count
 	}
 	parts = append(parts, "exps=CPU")
-	return stringsJoin(parts, ",")
+	return strings.Join(parts, ",")
 }
 
 func otStringUsesDevice(ot string, index int) bool {
@@ -2111,16 +2111,6 @@ func deviceName(backendTag string, index int) string {
 	return fmt.Sprintf("CUDA%d", index)
 }
 
-func stringsJoin(parts []string, sep string) string {
-	if len(parts) == 0 {
-		return ""
-	}
-	result := parts[0]
-	for i := 1; i < len(parts); i++ {
-		result += sep + parts[i]
-	}
-	return result
-}
 
 // computeKVTotalMB calculates exact KV cache size.
 func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string) int {
@@ -3319,9 +3309,8 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 		"--ctx-size", fmt.Sprintf("%d", s.ContextSize),
 	}
 
-	// Flash attention: only enable when KV is GPU-resident (the FA CUDA kernel
-	// requires its KV tensor on the same device doing the attention compute).
-	if s.FlashAttention {
+	// NEW — emit whenever KV is GPU-resident, regardless of the stored bool:
+	if s.FlashAttention || s.KVPlacement == "gpu" {
 		args = append(args, "--flash-attn", "on")
 	}
 
@@ -3457,12 +3446,6 @@ func (s *Strategy) Args(modelPath string, port int) []string {
 	if s.Draft != nil && s.Draft.Type != DraftNone {
 		args = append(args, DraftFlags(s.Draft)...)
 	}
-
-	// Server --timeout: slow local models and queued Workflow agents must not be
-	// killed by a backend's 600s/3600s socket default. Backends do not agree that
-	// zero means disabled, so use the largest signed 32-bit seconds value instead
-	// (about 68 years). Process health and client disconnects still stop real work.
-	args = append(args, "--timeout", "2147483647")
 
 	return args
 }
@@ -4482,8 +4465,8 @@ type probeCache struct {
 const probeCacheSchema = 2
 
 // probeParallelKey preserves the legacy serial key (0) for normal --parallel 1
-// launches while isolating multi-slot graph measurements such as Claude Code's
-// --parallel 4. Graph allocation changes with slot count; sharing those probes
+// launches while isolating multi-slot graph measurements (e.g. --parallel 4).
+// Graph allocation changes with slot count; sharing those probes
 // was another form of compute-buffer double accounting across launch modes.
 func probeParallelKey(parallel int) int {
 	if parallel <= 1 {

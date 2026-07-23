@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/backends"
+	"github.com/rrifftt/ggrun/pkg/backends"
 )
 
 // Config holds ggrun settings with precedence:
@@ -60,7 +60,7 @@ var DefaultKeys = []string{
 func Defaults() *Config {
 	home, _ := os.UserHomeDir()
 	return &Config{
-		Port:          8081,
+		Port:          8080,
 		Ctx:           "fit",
 		MaxRestarts:   5,
 		KeepAlive:     0,

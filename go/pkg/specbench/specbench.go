@@ -91,7 +91,7 @@ func longReviewPrompt() string {
 	// The leading-space form of this common word is one token in the target
 	// tokenizer families used by the harness. Slightly exceed 60k so the
 	// server-reported token count proves the long-context gate without getting
-	// close to a 65,536-token Claude Code slot.
+	// close to a 65,536-token slot.
 	for i := 0; i < 60500; i++ {
 		b.WriteString(" event")
 	}

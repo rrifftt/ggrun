@@ -3,7 +3,7 @@ package placement
 import (
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 func TestResolveAutoKVPlacement(t *testing.T) {

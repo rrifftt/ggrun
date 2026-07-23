@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 func TestSpecPerformanceProfileRoundTripAndExactScope(t *testing.T) {

@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/config"
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/libhub"
-	"github.com/raketenkater/ggrun/pkg/placement"
-	"github.com/raketenkater/ggrun/pkg/specbench"
+	"github.com/rrifftt/ggrun/pkg/config"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/libhub"
+	"github.com/rrifftt/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/specbench"
 )
 
 type specTestConfiguration struct {
@@ -234,7 +234,6 @@ func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.C
 	if err != nil {
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, nil, err
 	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet)
 	if ceiling > 0 && (strategy.Draft == nil || strategy.Draft.Type != placement.DraftMTP) {
 		return specTestConfiguration{Name: name, DraftMax: ceiling}, strategy, fmt.Errorf("no compatible MTP path for selected backend")
 	}
@@ -258,17 +257,21 @@ func runSpecConfiguration(req *launchRequest, cfg *config.Config, caps *detect.C
 		timeout = 2 * time.Hour
 	}
 	modelName := filepath.Base(req.ModelPath)
-	if req.ClaudeCode {
-		modelName = "local"
-	}
-	result := (&specbench.Runner{
-		BaseURL: fmt.Sprintf("http://127.0.0.1:%d", req.Port), Model: modelName,
-		Timeout: timeout, Rounds: rounds, Parallel: parallel, Include60K: include60K,
-	}).Run()
+
 	draftPath := ""
-	if finalStrategy.Draft != nil {
+	if finalStrategy.Draft != nil && finalStrategy.Draft.Path != "" {
 		draftPath = finalStrategy.Draft.Path
 	}
+	runner := &specbench.Runner{
+		BaseURL:    fmt.Sprintf("http://localhost:%d", req.Port),
+		Model:      modelName,
+		Timeout:    timeout,
+		Rounds:     rounds,
+		Parallel:   parallel,
+		Include60K: include60K,
+	}
+	result := runner.Run()
+
 	configuration := specTestConfiguration{
 		Name: name, DraftMax: ceiling, Context: finalStrategy.ContextSize,
 		Parallel: parallel, DraftPath: draftPath, LaunchID: specLaunchIdentity(finalArgs), Result: result,

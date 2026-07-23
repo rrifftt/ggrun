@@ -17,7 +17,7 @@ import (
 const DefaultCommunityBaseURL = "https://raw.githubusercontent.com/raketenkater/ggrun-tunes/main/tunes"
 
 // CommunityRepoURL is where users share their own tuned configs.
-const CommunityRepoURL = "https://github.com/raketenkater/ggrun-tunes"
+const CommunityRepoURL = "https://github.com/rrifftt/ggrun-tunes"
 
 const (
 	communityHitTTL  = 7 * 24 * time.Hour

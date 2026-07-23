@@ -18,20 +18,19 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/raketenkater/ggrun/pkg/backends"
-	"github.com/raketenkater/ggrun/pkg/config"
-	"github.com/raketenkater/ggrun/pkg/detect"
-	"github.com/raketenkater/ggrun/pkg/gguf"
-	"github.com/raketenkater/ggrun/pkg/libhub"
-	"github.com/raketenkater/ggrun/pkg/placement"
-	"github.com/raketenkater/ggrun/pkg/probe"
-	"github.com/raketenkater/ggrun/pkg/recovery"
-	"github.com/raketenkater/ggrun/pkg/server"
-	"github.com/raketenkater/ggrun/pkg/tune"
+	"github.com/rrifftt/ggrun/pkg/backends"
+	"github.com/rrifftt/ggrun/pkg/config"
+	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/gguf"
+	"github.com/rrifftt/ggrun/pkg/libhub"
+	"github.com/rrifftt/ggrun/pkg/placement"
+	"github.com/rrifftt/ggrun/pkg/probe"
+	"github.com/rrifftt/ggrun/pkg/recovery"
+	"github.com/rrifftt/ggrun/pkg/server"
+	"github.com/rrifftt/ggrun/pkg/tune"
 )
 
 // version is the build version; release builds override it via -ldflags.
-var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -47,15 +46,9 @@ func main() {
 	switch args[0] {
 	case "help", "--help", "-h":
 		usage()
-	case "version", "--version", "-v":
-		fmt.Println("ggrun", version)
 	case "detect":
 		cmdDetect()
-	case "claude-status":
-		cmdClaudeStatus(args[1:])
-	case "claude-workflow-hook":
-		cmdClaudeWorkflowHook(args[1:])
-	case "dry-run":
+			case "dry-run":
 		cmdDryRun(args[1:])
 	case "probe":
 		cmdProbe()
@@ -65,9 +58,7 @@ func main() {
 		cmdTune(args[1:])
 	case "spec-test":
 		cmdSpecTest(args[1:])
-	case "models":
-		cmdModels(args[1:])
-	default:
+		default:
 		usage()
 		os.Exit(2)
 	}
@@ -77,7 +68,6 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage: ggrun [command] [args]
 
 Commands:
-  version              Show version
   detect               Detect hardware capabilities
   probe                Check free GPU/RAM memory
   kv-probe <model>     Measure real KV cache size (2 short launches) and cache it,
@@ -85,10 +75,9 @@ Commands:
   dry-run <model.gguf> Print computed flags without launching
   tune <model.gguf>    AI-tune model for best performance
   spec-test <model>    Verify MTP ceilings 1-4 against a target-only baseline
-  models [list|browse|path|rm] List, browse, locate, or safely remove GGUF models
 
 Launch flags:
-  -port int            Server port (default 8081)
+  -port int            Server port (default 8080)
   -ctx string          Context size: fit|max|token count (default fit)
   -kv string           KV placement: auto|gpu|cpu (default auto)
   -kv-quality string   KV quality: high|mid|low or an exact llama.cpp type such as q5_1 (default mid)
@@ -99,14 +88,13 @@ Launch flags:
   --vram-headroom str  Reserve VRAM the recommender/placement won't use, e.g. 2G
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
   -vision              Enable vision (auto-detect mmproj)
-  --claude-code        Serve locally and launch Claude Code with workflows/research
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
 `)
 }
 
 func knownCommand(cmd string) bool {
 	switch cmd {
-	case "help", "--help", "-h", "version", "--version", "-v", "detect", "claude-status", "claude-workflow-hook", "dry-run", "probe", "kv-probe", "tune", "spec-test", "models":
+	case "help", "--help", "-h", "detect", "dry-run", "probe", "kv-probe", "tune", "spec-test":
 		return true
 	default:
 		return false
@@ -257,9 +245,8 @@ type launchRequest struct {
 	RAMHeadroomMB     int
 	NoMMap            bool
 	Parallel          int
-	ParallelSet       bool // --parallel given explicitly; claude-code mode must not override it
+	ParallelSet       bool // --parallel given explicitly
 	Benchmark         bool
-	ClaudeCode        bool
 	SpecDraftMax      int // internal spec-test ceiling; not a public launch override
 	ExtraArgs         []string
 }
@@ -286,7 +273,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 		RAMHeadroomMB:   parseBudgetMB(cfg.RAMHeadroom),
 	}
 	if req.Port == 0 {
-		req.Port = 8081
+		req.Port = 8080
 	}
 	if req.KVPlacement == "" {
 		req.KVPlacement = "auto"
@@ -468,9 +455,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			req.Host = v
 		case "--vision":
 			req.VisionAuto = true
-		case "--claude-code":
-			req.ClaudeCode = true
-		case "--no-mmap":
+				case "--no-mmap":
 			req.NoMMap = true
 		case "--mmproj":
 			v, err := next()
@@ -893,21 +878,7 @@ func backendMatches(info *backendInfo, name, want string) bool {
 
 func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfile, be *backendInfo, cacheDir string) placement.Options {
 	ctxSize := resolveCtxFlag(req.CtxFlag, model.CTXTrain)
-	if req.ClaudeCode && ctxSize <= 0 {
-		// Claude Code needs a large shared window for its main conversation plus
-		// background work. In auto/fit mode use the model's native window, capped
-		// at 1M so the four default slots each retain about 256k tokens. Explicit
-		// numeric/max context choices are resolved above and remain user overrides.
-		ctxSize = model.CTXTrain
-		if ctxSize > 1048576 {
-			ctxSize = 1048576
-		} else if ctxSize <= 0 {
-			// Unknown metadata must not make a small/old model allocate a speculative
-			// 1M KV cache. Two 64k slots are a portable Claude Code baseline; models
-			// that advertise a larger native window still get it automatically.
-			ctxSize = 131072
-		}
-	}
+
 	opts := placement.Options{
 		ContextSize:            ctxSize,
 		KVPlacement:            req.KVPlacement,
@@ -932,7 +903,6 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		CacheFile:              req.TuneCache,
 		Parallel:               req.Parallel,
 		// Disable the model's thinking only when measuring (`--benchmark`); a
-		// normal launch keeps reasoning on so tools like Claude Code can think.
 		ReasoningOff: req.Benchmark,
 	}
 	if req.GPUsFlag != "" {
@@ -940,7 +910,6 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 			opts.GPUs = indices
 		}
 	}
-	opts.Parallel = claudeCodeParallel(opts.Parallel, req.ClaudeCode, req.ParallelSet)
 	return opts
 }
 
@@ -948,86 +917,14 @@ func requestSamplingProfile(req *launchRequest, model *placement.ModelProfile) s
 	if req == nil {
 		return "default"
 	}
-	// Include every explicit backend override: unknown fork flags can affect
-	// sampling or throughput too. Then add ggrun's effective Claude defaults so
-	// a Claude profile cannot be reused by an ordinary OpenAI-compatible launch.
 	values := append([]string(nil), req.ExtraArgs...)
-	values = claudeCodeSamplingArgs(values, req.ClaudeCode, model)
-	if len(values) == 0 && !req.ClaudeCode {
+	if len(values) == 0 {
 		return "default"
 	}
-	values = append(values, fmt.Sprintf("claude-code=%t", req.ClaudeCode))
 	sum := sha256.Sum256([]byte(strings.Join(values, "\x00")))
 	return fmt.Sprintf("custom-%x", sum[:8])
 }
-
-// claudeCodeParallel requests four sequence slots in Claude Code mode so the main
-// turn and a small Workflow fan-out can make progress concurrently. Four is a
-// concurrency default, not a claim of 4x inference throughput: active requests on
-// a bandwidth-bound big MoE still share the same memory bandwidth.
-//
-// claudeCodeSlotAdjust runs after placement and lowers this automatic value when
-// the selected total context cannot preserve a useful per-slot window. An explicit
-// --parallel always wins, including --parallel 2 for a tighter big-MoE setup or 8
-// for hardware that has been proven stable under wider fan-out.
-func claudeCodeParallel(parallel int, claudeCode, explicit bool) int {
-	if claudeCode && !explicit && parallel < 4 {
-		return 4
-	}
-	return parallel
-}
-
-// claudeSlotTarget is the per-slot context Claude Code comfortably works in.
-// claudeSlotMin is the floor below which a session can't even hold the system
 // prompt (~15-20k tokens) and requests truncate or fail outright.
-const (
-	claudeSlotTarget = 65536
-	claudeSlotMin    = 24576
-	// Live parallel-2 testing on an offloaded DeepSeek V4 showed a 512-token
-	// prompt chunk holding the scheduler for about 22 seconds and reducing a
-	// concurrent worker to 0.05-0.15 tok/s. Match the proven 128-token microbatch
-	// so another Claude slot gets a scheduling opportunity roughly four times as
-	// often. Explicit extra backend arguments still override this value.
-	claudeHybridBatch = 128
-)
-
-// claudeCodeSlotAdjust caps the computed --parallel so each slot keeps a workable
-// context window. claudeCodeParallel floors parallel at 4 BEFORE placement, which
-// is right for large contexts, but 131072/4 is only 32k and "fit" mode can select
-// even less (e.g. 32768/4 = 8k). Fewer, bigger slots beat undersized slots:
-// more, broken ones: concurrent requests then queue (API_TIMEOUT_MS covers the
-// wait) and may re-process the prompt on interleave — slow, but functional.
-// Runs after placement.Compute and before Strategy.Args, so the emitted
-// --parallel and the derived CLAUDE_AUTOCOMPACT_PCT_OVERRIDE stay consistent.
-func claudeCodeSlotAdjust(strategy *placement.Strategy, claudeCode, parallelExplicit bool) {
-	if !claudeCode || strategy == nil {
-		return
-	}
-	if strategy.HasSSM && strategy.BatchSize > claudeHybridBatch {
-		fmt.Printf("[claude-code] hybrid recurrent model: lowering --batch-size from %d to %d so prompt prefill does not starve another active slot\n",
-			strategy.BatchSize, claudeHybridBatch)
-		strategy.BatchSize = claudeHybridBatch
-	}
-	if strategy.ContextSize <= 0 || strategy.Parallel <= 1 {
-		return
-	}
-	// A user-chosen --parallel is a deliberate slot layout — keep it, warn below if tight.
-	if !parallelExplicit {
-		p := strategy.ContextSize / claudeSlotTarget
-		if p < 1 {
-			p = 1
-		}
-		if p < strategy.Parallel {
-			fmt.Printf("[claude-code] context %d is too small for %d slots — lowering --parallel to %d (~%dk per slot)\n",
-				strategy.ContextSize, strategy.Parallel, p, strategy.ContextSize/p/1000)
-			strategy.Parallel = p
-		}
-	}
-	if slot := strategy.ContextSize / strategy.Parallel; slot < claudeSlotMin {
-		fmt.Printf("[claude-code] warning: only ~%dk context per slot — Claude Code needs ~24k+ just for its system prompt. Use a larger --ctx-size or a smaller model.\n", slot/1000)
-	}
-}
-
 func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, strategy *placement.Strategy) []string {
 	if req.SpecDraftMax > 0 && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
 		strategy.Draft.DraftMax = req.SpecDraftMax
@@ -1035,15 +932,11 @@ func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendIn
 	serverArgs := append([]string{be.Path}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, req.ExtraArgs...)
 	serverArgs = applyTuneCache(req, serverArgs, cfg.CacheDir, be.Tag, strategy.MMProjPath != "", caps)
-	serverArgs = claudeCodeAliasArgs(serverArgs, req.ClaudeCode)
-	serverArgs = claudeCodeSamplingArgs(serverArgs, req.ClaudeCode, model)
-	serverArgs = claudeCodeCacheArgs(serverArgs, req.ClaudeCode, be.Help, strategy == nil || !strategy.HasSSM)
-	serverArgs = claudeCodeProgressServerArgs(serverArgs, req.ClaudeCode, be.Help)
+	serverArgs = ensureFlashAttnForGPUKV(serverArgs)
 	return serverArgs
 }
 
 // specLaunchIdentity fingerprints the final runtime argv after tune caches,
-// automatic Claude sampling and recovery placement have all been applied. Port
 // and bind host are excluded because they do not affect model performance.
 func specLaunchIdentity(args []string) string {
 	canonical := make([]string, 0, len(args))
@@ -1061,29 +954,7 @@ func specLaunchIdentity(args []string) string {
 }
 
 func startLaunchProcess(req *launchRequest, cfg *config.Config, serverArgs []string, timeout time.Duration) (*server.Process, error) {
-	if req.ClaudeCode {
-		// In Claude Code mode ggrun hands the terminal to the `claude` client, so
-		// the backend's ongoing per-request logs must go to a file instead of
-		// bleeding into Claude Code's UI.
-		logPath := claudeServerLogPath(cfg, req.Port)
-		if lf, ferr := os.Create(logPath); ferr == nil {
-			_, _ = fmt.Fprintf(lf, "[ggrun] launch: %s\n", formatCommand(serverArgs))
-			fmt.Printf("[claude-code] backend logs -> %s\n", logPath)
-			return server.StartWithTimeoutTo(serverArgs, req.Port, timeout, lf, lf)
-		}
-	}
 	return server.StartWithTimeout(serverArgs, req.Port, timeout)
-}
-
-func claudeServerLogPath(cfg *config.Config, port int) string {
-	logDir := ""
-	if cfg != nil {
-		logDir = cfg.LogDir
-	}
-	if logDir == "" {
-		logDir = os.TempDir()
-	}
-	return filepath.Join(logDir, fmt.Sprintf("ggrun-claude-server-%d.log", port))
 }
 
 func recordMeasuredLaunchProbes(cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverLog string, baselineVRAMByGPU map[int]int) map[int]int {
@@ -1121,7 +992,6 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 	// recompute to reload it instead of reusing the pre-launch model struct state.
 	// Also bypass the placement cache: reloading the placement that just launched
 	// made this calibration pass incapable of filling newly proven free VRAM.
-	// This was especially visible when the Claude reviewer changed the baseline:
 	// a safe but sparse five-block cache kept winning even when six blocks fit.
 	model.MeasuredKVBytesPerTok = nil
 	opts := measuredPromotionOptions(req, model, be, cfg.CacheDir)
@@ -1130,7 +1000,6 @@ func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *b
 		fmt.Fprintf(os.Stderr, "[launch] calibration: measured placement recompute failed: %v\n", err)
 		return nil, nil, false
 	}
-	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet)
 	if !shouldPromoteMoEPlacement(current, next) {
 		return nil, nil, false
 	}
@@ -1395,7 +1264,6 @@ func oomLogFingerprint(logData string) string {
 }
 
 // recordRuntimeOOMLog records either the exact failed allocation or the
-// bounded VMM fallback above. markerPath prevents a Claude crash recorded on
 // exit from being counted again when its previous log is recovered next run.
 func recordRuntimeOOMLog(cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, logData, markerPath string) (device, reserveMB int, estimated, changed, ok bool, err error) {
 	if cfg == nil || model == nil || strategy == nil || be == nil || caps == nil {
@@ -1422,49 +1290,6 @@ func recordRuntimeOOMLog(cfg *config.Config, model *placement.ModelProfile, stra
 		}
 	}
 	return device, reserveMB, estimated, changed, true, nil
-}
-
-func previousClaudeLogMatches(logData string, model *placement.ModelProfile, strategy *placement.Strategy) bool {
-	if model == nil || strategy == nil || strategy.Parallel < 1 || strategy.ContextSize < 1 {
-		return false
-	}
-	if !strings.Contains(logData, "health check OK") || !strings.Contains(logData, filepath.Base(model.Path)) {
-		return false
-	}
-	wantSlots := fmt.Sprintf("n_slots = %d, n_ctx_slot = %d", strategy.Parallel, strategy.ContextSize/strategy.Parallel)
-	return strings.Contains(logData, wantSlots)
-}
-
-func recoverPreviousClaudeRuntimeOOM(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities) (*placement.Strategy, error) {
-	if req == nil || !req.ClaudeCode {
-		return strategy, nil
-	}
-	logPath := claudeServerLogPath(cfg, req.Port)
-	logData, err := os.ReadFile(logPath)
-	if err != nil || !previousClaudeLogMatches(string(logData), model, strategy) {
-		return strategy, nil
-	}
-	markerPath := logPath + ".oom-recorded"
-	device, reserveMB, estimated, changed, ok, err := recordRuntimeOOMLog(cfg, model, strategy, be, caps, string(logData), markerPath)
-	if err != nil {
-		return nil, fmt.Errorf("recover previous Claude runtime OOM: %w", err)
-	}
-	if !ok || !changed {
-		return strategy, nil
-	}
-	if estimated {
-		fmt.Printf("[launch] recovered previous CUDA VMM OOM on device %d; llama.cpp omitted its allocation size, reserving %d MiB runtime headroom and re-planning\n", device, reserveMB)
-	} else {
-		fmt.Printf("[launch] recovered previous CUDA OOM on device %d; reserving the measured %d MiB allocation and re-planning\n", device, reserveMB)
-	}
-	opts := placementOptionsFromRequest(req, model, be, cfg.CacheDir)
-	opts.SkipPlacementCache = true
-	next, err := placement.Compute(caps, model, opts)
-	if err != nil {
-		return nil, err
-	}
-	claudeCodeSlotAdjust(next, req.ClaudeCode, req.ParallelSet)
-	return next, nil
 }
 
 func applyDeratedPlacementEntry(strategy *placement.Strategy, entry *placement.CacheEntry) {
@@ -1521,6 +1346,35 @@ func resolveLaunchBackend(req *launchRequest, model *placement.ModelProfile, cap
 	be = routeArchBackend(be, model, req)
 	preflightBackendArch(model, be, caps)
 	return be
+}
+
+// ensureFlashAttnForGPUKV guarantees --flash-attn on is present whenever KV
+// is GPU-resident. Some tune-cache configs or manual overrides may strip it,
+// but the CUDA FA kernel requires it for correct GPU KV operation.
+func ensureFlashAttnForGPUKV(args []string) []string {
+	hasKVOffload := false
+	hasNoKVOffload := false
+	hasFA := false
+	for i, a := range args {
+		switch a {
+		case "--kv-offload":
+			hasKVOffload = true
+		case "--no-kv-offload":
+			hasNoKVOffload = true
+		case "--flash-attn", "-fa":
+			hasFA = true
+			// Ensure value is "on"
+			if i+1 < len(args) && args[i+1] == "off" {
+				args[i+1] = "on"
+			}
+		}
+	}
+	// KV on GPU (explicit --kv-offload or absence of --no-kv-offload) needs FA
+	kvOnGPU := hasKVOffload || !hasNoKVOffload
+	if kvOnGPU && !hasFA {
+		args = append(args, "--flash-attn", "on")
+	}
+	return args
 }
 
 func applyTuneCache(req *launchRequest, serverArgs []string, cacheDir, backendTag string, vision bool, caps *detect.Capabilities) []string {
@@ -1950,22 +1804,18 @@ func cmdDryRun(args []string) {
 		fmt.Fprintf(os.Stderr, "Error computing placement: %v\n", err)
 		os.Exit(1)
 	}
-	claudeCodeSlotAdjust(strategy, req.ClaudeCode, req.ParallelSet)
 
 	serverArgs := append([]string{binPath}, strategy.Args(req.ModelPath, req.Port)...)
 	serverArgs = append(serverArgs, req.ExtraArgs...)
 	serverArgs = applyTuneCache(req, serverArgs, cfg.CacheDir, be.Tag, strategy.MMProjPath != "", caps)
-	serverArgs = claudeCodeAliasArgs(serverArgs, req.ClaudeCode)
-	serverArgs = claudeCodeSamplingArgs(serverArgs, req.ClaudeCode, model)
-	serverArgs = claudeCodeCacheArgs(serverArgs, req.ClaudeCode, be.Help, strategy == nil || !strategy.HasSSM)
-	serverArgs = claudeCodeProgressServerArgs(serverArgs, req.ClaudeCode, be.Help)
+	serverArgs = ensureFlashAttnForGPUKV(serverArgs)
 	if envPrefix := applyGPUVisibility(req, backendDialect(be)); envPrefix != "" {
 		fmt.Print(envPrefix + " ")
 	}
 	fmt.Println()
 	fmt.Println("[ggrun] Dry Run: Copy-pasteable command")
 	fmt.Println()
-	binName := filepath.Base(be.Path)
+	binName := "./" + filepath.Base(be.Path)
 	cmdArgs := serverArgs[1:] // skip the binary path
 	fmt.Printf("%s ", binName)
 	for i, arg := range cmdArgs {
@@ -1982,245 +1832,6 @@ func cmdDryRun(args []string) {
 	if s := placement.DraftSummary(strategy.Draft); s != "" {
 		fmt.Printf("[spec] %s\n", s)
 	}
-	if req.ClaudeCode {
-		fmt.Println("[claude-code] A real launch also starts the local Auto reviewer/router and then opens Claude Code.")
-	}
-}
-
-// printClaudeCodeRecipe prints the exact env to point Claude Code at this
-// local ggrun endpoint. In Auto mode the port belongs to ggrun's loopback
-// router; normal turns stream to the main llama-server and hidden safety turns
-// go to the dedicated reviewer.
-func printClaudeCodeRecipe(host string, port int, serverArgs []string) {
-	clientHost := host
-	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
-		clientHost = "127.0.0.1"
-	}
-	pct := claudeCodeAutocompactPct(serverArgs)
-	slot := ""
-	if ctx := argIntValue(serverArgs, "--ctx-size", "-c", "--ctx"); ctx > 0 {
-		par := argIntValue(serverArgs, "--parallel", "-np")
-		if par < 1 {
-			par = 1
-		}
-		slot = fmt.Sprintf(" (~%dk per slot at --parallel %d)", ctx/par/1000, par)
-	}
-	// Every inference tier maps to local so foreground and background model work
-	// stays on this server rather than leaking to api.anthropic.com.
-	fmt.Println()
-	fmt.Println("[claude-code] In another terminal:")
-	// Match claudeCodeEnv: drop any real key so the dummy token + local base URL win,
-	// otherwise Claude Code prefers the real key and routes to api.anthropic.com.
-	fmt.Println("  unset ANTHROPIC_API_KEY")
-	fmt.Printf("  export ANTHROPIC_BASE_URL=http://%s:%d ANTHROPIC_AUTH_TOKEN=ggrun\n", clientHost, port)
-	fmt.Println("  export ANTHROPIC_MODEL=local ANTHROPIC_SMALL_FAST_MODEL=local")
-	fmt.Println("  export ANTHROPIC_DEFAULT_HAIKU_MODEL=local ANTHROPIC_DEFAULT_SONNET_MODEL=local ANTHROPIC_DEFAULT_OPUS_MODEL=local")
-	fmt.Printf("  export API_TIMEOUT_MS=%d  # maximum safe timer: no practical local-inference deadline\n", claudeNoTimeoutMS)
-	fmt.Printf("  export CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d  # background agents may be quiet during local prefill\n", claudeNoTimeoutMS)
-	fmt.Println("  export CLAUDE_ENABLE_BYTE_WATCHDOG=0 CLAUDE_ENABLE_STREAM_WATCHDOG=0 API_FORCE_IDLE_TIMEOUT=0")
-	fmt.Printf("  export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=%d  # compact early to fit the real slot%s\n", pct, slot)
-	claudeArgs, _ := claudeCodeProgressClientArgs(nil, port)
-	claudeArgs = claudeCodeWorkflowPromptArgs(claudeArgs)
-	claudeArgs = append(claudeCodePermissionArgs(claudeArgs), claudeArgs...)
-	claudeArgs = append(claudeArgs, "--disallowedTools", "WebSearch")
-	if _, err := exec.LookPath("uvx"); err == nil {
-		claudeArgs = append(claudeArgs,
-			"--allowedTools", "mcp__ddg-search__search,mcp__ddg-search__fetch_content",
-			"--mcp-config", `{"mcpServers":{"ddg-search":{"command":"uvx","args":["duckduckgo-mcp-server"]}}}`,
-		)
-		fmt.Printf("  %s\n", formatCommand(append([]string{"claude"}, claudeArgs...)))
-	} else {
-		fmt.Printf("  %s   # add a search MCP (e.g. uvx duckduckgo-mcp-server) for web research\n", formatCommand(append([]string{"claude"}, claudeArgs...)))
-	}
-}
-
-// claudeCodeEnv returns the child environment that points Claude Code at the
-// locally-served model. Every inference tier maps to "local" so background work
-// stays on the local server; ANTHROPIC_API_KEY is dropped so the dummy auth token
-// + base URL take effect.
-func claudeCodeEnv(host string, port int, serverArgs []string) []string {
-	clientHost := host
-	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
-		clientHost = "127.0.0.1"
-	}
-	var env []string
-	for _, kv := range os.Environ() {
-		key, _, _ := strings.Cut(kv, "=")
-		switch key {
-		case "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
-			"ANTHROPIC_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
-			"ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL",
-			"API_TIMEOUT_MS", "API_FORCE_IDLE_TIMEOUT", "CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS",
-			"CLAUDE_ENABLE_BYTE_WATCHDOG", "CLAUDE_ENABLE_STREAM_WATCHDOG",
-			"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
-			continue
-		}
-		env = append(env, kv)
-	}
-	return append(env,
-		fmt.Sprintf("ANTHROPIC_BASE_URL=http://%s:%d", clientHost, port),
-		"ANTHROPIC_AUTH_TOKEN=ggrun",
-		"ANTHROPIC_MODEL=local",
-		"ANTHROPIC_SMALL_FAST_MODEL=local",
-		"ANTHROPIC_DEFAULT_HAIKU_MODEL=local",
-		"ANTHROPIC_DEFAULT_SONNET_MODEL=local",
-		"ANTHROPIC_DEFAULT_OPUS_MODEL=local",
-		// JavaScript's maximum safe timer value is effectively no deadline for a
-		// local session. It covers foreground requests and queued Workflow fan-out.
-		fmt.Sprintf("API_TIMEOUT_MS=%d", claudeNoTimeoutMS),
-		// Background agents and streaming each have independent watchdogs. A giant
-		// local MoE can spend minutes in prompt processing without producing an event.
-		fmt.Sprintf("CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS=%d", claudeNoTimeoutMS),
-		"CLAUDE_ENABLE_BYTE_WATCHDOG=0",
-		"CLAUDE_ENABLE_STREAM_WATCHDOG=0",
-		// Compatibility with Claude Code versions that predate the named watchdogs.
-		"API_FORCE_IDLE_TIMEOUT=0",
-		// Behind a custom base URL Claude Code assumes a 200k window and won't
-		// auto-compact until ~92% of it (~184k tokens) — but each slot only has ctx/parallel,
-		// so the conversation overflows the slot and the backend fails the request
-		// ("context shift is disabled"). Compact early instead, at a percentage
-		// derived from the real slot size so it adapts to --parallel automatically.
-		// A user-set value still wins.
-		"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE="+envOr("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", strconv.Itoa(claudeCodeAutocompactPct(serverArgs))),
-	)
-}
-
-// envOr returns the current environment value for key, or def if unset/empty.
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// claudeCodePermissionArgs defaults local Claude Code to Auto. ggrun supplies
-// Auto's otherwise-missing classifier with a dedicated local reviewer and routes
-// only the hidden safety-monitor calls to it; Workflow, MCP, WebFetch, and Bash can
-// therefore run autonomously without bypassing Claude Code's safety rules.
-//
-// GGRUN_CLAUDE_PERMISSION_MODE can select another current Claude CLI mode. Set it
-// to "inherit" to preserve the user's settings.json default. An explicit
-// --permission-mode in extraArgs always wins.
-func claudeCodePermissionArgs(extraArgs []string) []string {
-	for _, arg := range extraArgs {
-		if arg == "--permission-mode" || strings.HasPrefix(arg, "--permission-mode=") {
-			return nil
-		}
-	}
-	mode := strings.TrimSpace(os.Getenv("GGRUN_CLAUDE_PERMISSION_MODE"))
-	if mode == "" {
-		mode = "auto"
-	}
-	if strings.EqualFold(mode, "inherit") {
-		return nil
-	}
-	// Keep invalid environment values from making Claude fail at startup. These
-	// choices match the current CLI; "default" is the docs/settings spelling of
-	// the CLI's "manual" mode.
-	switch strings.ToLower(mode) {
-	case "acceptedits":
-		mode = "acceptEdits"
-	case "auto":
-		mode = "auto"
-	case "bypasspermissions":
-		mode = "bypassPermissions"
-	case "manual", "default":
-		mode = "manual"
-	case "dontask":
-		mode = "dontAsk"
-	case "plan":
-		mode = "plan"
-	default:
-		mode = "auto"
-	}
-	return []string{"--permission-mode", mode}
-}
-
-// argIntValue returns the integer value following the LAST parseable occurrence of
-// any of names in args (e.g. argIntValue(args, "--ctx-size", "-c")). Last-wins mirrors
-// llama.cpp/ik_llama, which honor the final value when a flag is repeated — so when a
-// user appends their own --ctx-size/--parallel after ggrun's computed ones (serverArgs
-// has strategy flags first, then req.ExtraArgs), this reads the value the backend
-// actually uses. Returns -1 if no matching flag has a parseable value.
-func argIntValue(args []string, names ...string) int {
-	result := -1
-	for i := 0; i < len(args)-1; i++ {
-		for _, name := range names {
-			if args[i] == name {
-				if n, err := strconv.Atoi(args[i+1]); err == nil {
-					result = n
-				}
-			}
-		}
-	}
-	return result
-}
-
-// claudeCodeAutocompactPct derives the CLAUDE_AUTOCOMPACT_PCT_OVERRIDE value from
-// the backend's real per-slot context budget. llama.cpp/ik_llama split --ctx-size
-// across --parallel sequence slots, so each request's usable window is
-// ctx-size/parallel — far smaller than the 200k Claude Code assumes behind a custom
-// base URL. Without an override Claude Code won't auto-compact until ~92% of that
-// imagined 200k, long after the real slot has overflowed (and with --no-context-shift
-// the backend then hard-fails the request). We compute the percentage of the assumed
-// 200k window that lands at 75% of the real slot, leaving a quarter of the slot as
-// headroom for the in-flight reply, tool results, and jinja/template overhead the
-// proxied token count can't see. The same env var is inherited by subagents and
-// workflow agents, so their conversations get the same slot-safe trigger.
-//
-// Examples (ctx 262144): --parallel 4 → 65536/slot → 24; --parallel 8 → 32768 → 12.
-const claudeAssumedWindow = 200000
-
-func claudeCodeAutocompactPct(serverArgs []string) int {
-	ctx := argIntValue(serverArgs, "--ctx-size", "-c", "--ctx")
-	if ctx <= 0 {
-		return 25 // unknown ctx: keep the historical default
-	}
-	parallel := argIntValue(serverArgs, "--parallel", "-np")
-	if parallel < 1 {
-		parallel = 1
-	}
-	slot := ctx / parallel
-	// Upstream pads per-sequence context to 256-token alignment; align
-	// down so auto-compact triggers before the actual slot overflows.
-	slot = slot & ^255
-	if slot < 2048 {
-		slot = 2048
-	}
-	safe := int(float64(slot) * 0.75)
-	pct := safe * 100 / claudeAssumedWindow
-	// Floor so compaction still leaves working room; cap under Claude Code's own
-	// ~92% native trigger so the override never relaxes the default.
-	if pct < 5 {
-		pct = 5
-	}
-	if pct > 90 {
-		pct = 90
-	}
-	return pct
-}
-
-// claudeCodeSearchMCPArgs returns --mcp-config args that wire a no-key DuckDuckGo
-// search MCP into Claude Code, replacing the Anthropic-only WebSearch tool that
-// can't run against a local endpoint. Returns nil if the user already passed their
-// own --mcp-config or no MCP runner (uvx) is installed. The exposed tool surfaces to
-// agents and workflows as mcp__ddg-search__search and
-// mcp__ddg-search__fetch_content.
-func claudeCodeSearchMCPArgs(extraArgs []string) []string {
-	if hasArg(extraArgs, "--mcp-config") {
-		return nil
-	}
-	// The canonical duckduckgo-mcp-server is a Python package; uvx runs it with no
-	// install step and no API key. Only wire it up when uvx is actually present.
-	if _, err := exec.LookPath("uvx"); err != nil {
-		return nil
-	}
-	cfg := `{"mcpServers":{"ddg-search":{"command":"uvx","args":["duckduckgo-mcp-server"]}}}`
-	args := []string{"--mcp-config", cfg}
-	if !hasArg(extraArgs, "--allowedTools") && !hasArg(extraArgs, "--allowed-tools") {
-		args = append(args, "--allowedTools", "mcp__ddg-search__search,mcp__ddg-search__fetch_content")
-	}
-	return args
 }
 
 // patchPlacementArgs replaces only the placement flags (-ot, --n-cpu-moe,
@@ -2266,143 +1877,6 @@ func patchPlacementArgs(args []string, s *placement.Strategy) []string {
 		set("-b", strconv.Itoa(s.BatchSize))
 	}
 	return out
-}
-
-// claudeCodeSamplingArgs appends anti-loop sampling defaults in Claude Code mode.
-// The Anthropic /v1/messages conversion only forwards temperature/top_p/top_k from
-// the client (server-chat.cpp), and the Anthropic API has no penalty fields at all —
-// so repetition control MUST come from server-side defaults, and ik_llama ships with
-// every penalty disabled (repeat 1.0, presence 0.0). Quantized thinking models
-// (Qwen3.x model card explicitly warns) fall into endless repetition without them:
-// the user-visible symptom is repeated phrases and the model re-issuing the same
-// tool call, since the tool-call grammar shapes degenerate output into valid JSON.
-// Values: presence-penalty 1.0 (Qwen recommends up to 2 against repetition; 1.0 is
-// mild enough for code), repeat-penalty 1.05 over the last 512 tokens (targets tight
-// local loops, small enough to leave code idioms alone), top-k 20 / top-p 0.95 /
-// min-p 0 (Qwen thinking-mode recommendation; also softens the client's greedy
-// temperature-0 classifier calls, where penalties still apply to the argmax).
-// Any flag the user already passed (ExtraArgs) wins — we skip it here.
-func claudeCodeSamplingArgs(args []string, claudeCode bool, model *placement.ModelProfile) []string {
-	if !claudeCode {
-		return args
-	}
-	defaults := [][2]string{
-		{"--presence-penalty", "1.0"},
-		{"--repeat-penalty", "1.05"},
-		{"--repeat-last-n", "512"},
-		{"--top-k", "20"},
-		{"--top-p", "0.95"},
-		{"--min-p", "0.0"},
-	}
-	if model != nil && strings.EqualFold(model.ModelArch, "deepseek4") {
-		// V4 template starts assistant turns inside <think>. The validated
-		// server recipe closes that immediately; leaving the budget unlimited
-		// made Claude Code requests wander in malformed thinking output and the
-		// Anthropic parser returned 500s before any useful tool call/content.
-		defaults = [][2]string{
-			{"--presence-penalty", "1.0"},
-			{"--repeat-penalty", "1.05"},
-			{"--repeat-last-n", "512"},
-			{"--temp", "0.7"},
-			{"--top-k", "40"},
-			{"--top-p", "0.95"},
-			{"--min-p", "0.05"},
-			{"--reasoning-budget", "0"},
-		}
-	}
-	for _, d := range defaults {
-		if !hasArg(args, d[0]) {
-			args = append(args, d[0], d[1])
-		}
-	}
-	return args
-}
-
-// claudeCodeAliasArgs appends `--alias local` so the backend's /v1/models advertises
-// "local", matching the ANTHROPIC_MODEL=local the client uses. Without it llama.cpp/
-// ik_llama advertise the gguf file path as the model id, and Claude Code's interactive
-// model check rejects "local" ("the selected model (local) ... may not exist"). Both
-// backends honor --alias (verified). No-op outside claude-code mode, or if the user
-// already passed an alias.
-func claudeCodeAliasArgs(args []string, claudeCode bool) []string {
-	if !claudeCode || hasArg(args, "--alias") || hasArg(args, "-a") {
-		return args
-	}
-	return append(args, "--alias", "local")
-}
-
-// claudeCodeCacheArgs enables chunk-level KV reuse for repeated system, tool,
-// and workflow blocks that move after new conversation content is inserted.
-// Ordinary prompt caching only reuses a common prefix; cache-reuse can shift a
-// later matching chunk into its new position. The value 256 is the conservative
-// llama.cpp coding preset. Users can disable it explicitly, and older backends
-// remain compatible because support is checked before adding the flag.
-func claudeCodeCacheArgs(args []string, claudeCode bool, backendHelp string, shiftableContext bool) []string {
-	if !claudeCode || !shiftableContext || !strings.Contains(backendHelp, "--cache-reuse") {
-		return args
-	}
-	hasFlag := func(flag string) bool {
-		for _, arg := range args {
-			if arg == flag || strings.HasPrefix(arg, flag+"=") {
-				return true
-			}
-		}
-		return false
-	}
-	if hasFlag("--cache-reuse") || hasFlag("--no-cache-prompt") {
-		return args
-	}
-	return append(args, "--cache-reuse", "256")
-}
-
-// runClaudeCodeClient launches Claude Code in the foreground wired to the local
-// server, inheriting the terminal. It returns claude's exit code, or -1 if the
-// `claude` CLI isn't installed (so the caller can fall back to the recipe).
-func runClaudeCodeClient(host string, port int, serverArgs, extraArgs []string) int {
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return -1
-	}
-	clientHost := host
-	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
-		clientHost = "127.0.0.1"
-	}
-	fmt.Printf("[claude-code] Claude Code → http://%s:%d\n", clientHost, port)
-	args := claudeCodeWorkflowPromptArgs(extraArgs)
-	if permissionArgs := claudeCodePermissionArgs(extraArgs); permissionArgs != nil {
-		args = append(permissionArgs, args...)
-		if len(permissionArgs) == 2 && permissionArgs[1] == "auto" {
-			fmt.Println("[claude-code] Permission mode: Auto (dedicated local safety reviewer; fail-closed).")
-		} else if len(permissionArgs) == 2 && permissionArgs[1] == "acceptEdits" {
-			fmt.Println("[claude-code] Permission mode: acceptEdits (explicit override; shell actions still ask).")
-		}
-	}
-	// Built-in WebSearch is an Anthropic server-side tool; on a local endpoint it
-	// can't run, and the model loops on it while the auto-permission classifier
-	// fails. Disable it and wire a no-key DuckDuckGo MCP in its place so agents and
-	// workflows can still do web research. Skip either if the user passed their own.
-	if !hasArg(extraArgs, "--disallowedTools") {
-		args = append([]string{"--disallowedTools", "WebSearch"}, args...)
-	}
-	if mcp := claudeCodeSearchMCPArgs(extraArgs); mcp != nil {
-		args = append(mcp, args...)
-		fmt.Println("[claude-code] Online research enabled through DuckDuckGo MCP (search + fetch_content).")
-	} else {
-		fmt.Println("[claude-code] WebSearch disabled (Anthropic-only); install uvx or add a search MCP for web research.")
-	}
-	cmd := exec.Command(claudePath, args...)
-	cmd.Env = claudeCodeEnv(host, port, serverArgs)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			return ee.ExitCode()
-		}
-		fmt.Fprintf(os.Stderr, "[claude-code] failed to run claude: %v\n", err)
-		return 1
-	}
-	return 0
 }
 
 // waitForHealth polls the server's /health (then /v1/models) until it answers or
@@ -2663,7 +2137,6 @@ func guardPortFree(port int, context string) error {
 	return fmt.Errorf("port %d is already in use; choose a free --port for %s", port, context)
 }
 
-
 // isIKOnlyArch reports whether a model architecture can only be loaded by
 // ik_llama.cpp; mainline llama.cpp rejects these with "unknown model architecture".
 func isIKOnlyArch(arch string) bool {
@@ -2861,7 +2334,7 @@ func infoToProfile(info *gguf.Info, path string) *placement.ModelProfile {
 func parseModel(path string) (*placement.ModelProfile, error) {
 	info, err := gguf.Parse(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("model file %q: %w", path, err)
 	}
 
 	profile := infoToProfile(info, path)

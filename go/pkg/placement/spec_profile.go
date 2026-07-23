@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 const SpecProfileSchemaVersion = 1

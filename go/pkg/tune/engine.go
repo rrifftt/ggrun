@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/raketenkater/ggrun/pkg/benchmark"
-	"github.com/raketenkater/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/benchmark"
+	"github.com/rrifftt/ggrun/pkg/detect"
 )
 
 // Engine runs the AI-tune optimization loop.
@@ -285,33 +285,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			continue
 		}
 
-		// Pre-launch OOM prediction: skip candidates that are mathematically
-		// guaranteed to OOM, saving 30-60s per skipped candidate.
-		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
-			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
-			}
-			crashed := Entry{
-				Timestamp:     Now(),
-				ModelPath:     modelPath,
-				ModelName:     e.Model,
-				HardwareHash:  e.hardwareHash(),
-				Backend:       e.Backend,
-				Vision:        e.Vision,
-				Round:         round,
-				Name:          suggestion.Name,
-				Flags:         flagMap(candidateFlags),
-				OverrideFlags: overrides,
-				Status:        "predicted-oom",
-			}
-			e.addCache(&crashed)
-			entries = append(entries, crashed)
-			crashedFlagSets = append(crashedFlagSets, overrides)
-			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
-			round++
-			continue
-		}
-		
 		// Candidate flags need their own backend process; otherwise every round
 		// measures the same already-running baseline.
 		stopBaseline()
@@ -704,34 +677,7 @@ If current performance is already good, say so with empty flags`,
 	)
 }
 
-func applySuggestion(baseFlags, suggested []string) []string {
-	return applySuggestionWithProtection(baseFlags, suggested, nil)
-}
 
-func applySuggestionWithProtection(baseFlags, suggested []string, protected map[string]bool) []string {
-	result := make([]string, len(baseFlags))
-	copy(result, baseFlags)
-
-	for i := 0; i < len(suggested); i++ {
-		flag := suggested[i]
-		key := canonicalFlagName(flag)
-		if protected != nil && protected[key] {
-			if i+1 < len(suggested) && !strings.HasPrefix(suggested[i+1], "-") {
-				i++
-			}
-			continue
-		}
-		// Remove conflicting flags.
-		result = removeConflicting(result, flag)
-		result = append(result, flag)
-		// If flag has a value, consume next element.
-		if flagHasSeparateValue(suggested, i) {
-			result = append(result, suggested[i+1])
-			i++
-		}
-	}
-	return result
-}
 
 func removeConflicting(flags []string, newFlag string) []string {
 	want := canonicalFlagName(newFlag)
@@ -776,6 +722,43 @@ func QualityProtectedFlags() map[string]bool {
 }
 
 // ApplyOverrides applies a JSON-object tune override set on top of an argv.
+
+
+func applySuggestion(baseFlags, suggested []string) []string {
+	result := make([]string, len(baseFlags))
+	copy(result, baseFlags)
+	for i := 0; i < len(suggested); i++ {
+		key := canonicalFlagName(suggested[i])
+		result = removeConflicting(result, suggested[i])
+		result = append(result, suggested[i])
+		if flagHasSeparateValue(suggested, i) {
+			i++
+			result = append(result, suggested[i])
+		}
+		_ = key
+	}
+	return result
+}
+
+func applySuggestionWithProtection(baseFlags, suggested []string, protected map[string]bool) []string {
+	filtered := make([]string, 0, len(suggested))
+	for i := 0; i < len(suggested); i++ {
+		key := canonicalFlagName(suggested[i])
+		if protected != nil && protected[key] {
+			if flagHasSeparateValue(suggested, i) {
+				i++ // skip value too
+			}
+			continue
+		}
+		filtered = append(filtered, suggested[i])
+		if flagHasSeparateValue(suggested, i) {
+			i++
+			filtered = append(filtered, suggested[i])
+		}
+	}
+	return applySuggestion(baseFlags, filtered)
+}
+
 func ApplyOverrides(baseFlags []string, overrides map[string]interface{}, protected map[string]bool) []string {
 	values := sanitizeFlagValues(overrides, protected)
 	if len(values) == 0 {
