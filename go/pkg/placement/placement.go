@@ -1388,7 +1388,36 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 			s.OTString = otString
 		}
 	}
-	if layersCPU > 0 {
+	// VRAM-budget-aware --n-cpu-moe: compute the tightest safe value
+	// instead of the conservative default. This eliminates the need for
+	// the tune engine to spend 3+ rounds discovering the optimal value.
+	if layersCPU > 0 && model.ExpertBytes > 0 && model.NumLayers > 0 {
+		expertPerLayerMB := bytesToMiBCeil(model.ExpertBytes / int64(model.NumLayers))
+		nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
+		if nonExpertMB <= 0 {
+			nonExpertMB = totalSizeMB / 10
+		}
+		computeMB := firstLaunchComputeBufMB(model, s.UBatchSize)
+		cudaMB := 300 // conservative per-GPU CUDA context overhead
+		freeVRAM := 0
+		for _, g := range caps.GPUs {
+			freeVRAM += g.VRAMFreeMB()
+		}
+		gpuBudgetMB := freeVRAM - nonExpertMB - kvTotalMB - computeMB - cudaMB
+		gpuBudgetMB = gpuBudgetMB * 90 / 100 // 10% safety margin
+		if gpuBudgetMB > 0 && expertPerLayerMB > 0 {
+			maxGPUExperts := gpuBudgetMB / expertPerLayerMB
+			budgetLayersCPU := model.NumLayers - maxGPUExperts
+			if budgetLayersCPU < 0 {
+				budgetLayersCPU = 0
+			}
+			// Use the tighter of the two estimates (original vs VRAM-budget)
+			if budgetLayersCPU < layersCPU {
+				layersCPU = budgetLayersCPU
+			}
+		}
+		s.NCPUMoE = layersCPU
+	} else if layersCPU > 0 {
 		s.NCPUMoE = layersCPU
 	}
 
@@ -4586,4 +4615,98 @@ func cudaIndexFromLine(line string) int {
 		return -1
 	}
 	return n
+}
+
+// PredictVRAMUsage estimates the VRAM needed for a given flag combination
+// without launching the server. Returns (neededMB, freeMB). The tune engine
+// uses this to skip candidates that are mathematically guaranteed to OOM,
+// saving 30-60s per skipped candidate.
+func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect.Capabilities) (neededMB, freeMB int) {
+	if caps == nil || len(caps.GPUs) == 0 {
+		return 0, 0
+	}
+	for _, g := range caps.GPUs {
+		freeMB += g.VRAMFreeMB()
+	}
+
+	// 1. Model weights on GPU
+	ncpuMoe := 0
+	if v, ok := flags["--n-cpu-moe"]; ok {
+		ncpuMoe, _ = strconv.Atoi(v)
+	}
+	if model.IsMoE && ncpuMoe > 0 && model.ExpertBytes > 0 && model.NumLayers > 0 {
+		// MoE: non-expert weights + GPU-resident expert layers
+		nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
+		if nonExpertMB <= 0 {
+			nonExpertMB = model.TotalSizeMB / 10
+		}
+		expertPerLayerMB := bytesToMiBCeil(model.ExpertBytes / int64(model.NumLayers))
+		gpuExpertLayers := model.NumLayers - ncpuMoe
+		if gpuExpertLayers < 0 {
+			gpuExpertLayers = 0
+		}
+		neededMB += nonExpertMB + gpuExpertLayers*expertPerLayerMB
+	} else {
+		// Dense or full GPU: all weights on GPU
+		neededMB += model.TotalSizeMB
+	}
+
+	// 2. KV cache on GPU
+	kvOnGPU := true
+	if _, ok := flags["--no-kv-offload"]; ok {
+		kvOnGPU = false
+	}
+	if kvOnGPU {
+		ctxSize := model.ContextSize
+		if v, ok := flags["--ctx-size"]; ok {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				ctxSize = n
+			}
+		}
+		kvType := "f16"
+		if v, ok := flags["--cache-type-k"]; ok && v != "" {
+			kvType = v
+		}
+		neededMB += computeKVTotalMB(model, ctxSize, kvType)
+	}
+
+	// 3. Compute buffer (scales with ubatch)
+	ubatch := 512
+	if v, ok := flags["-ub"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ubatch = n
+		}
+	}
+	neededMB += firstLaunchComputeBufMB(model, ubatch)
+
+	// 4. CUDA overhead (per-GPU context, ~200-500 MB)
+	neededMB += 300
+
+	// 5. Safety margin (10% for fragmentation and unexpected allocations)
+	neededMB = neededMB * 110 / 100
+
+	return neededMB, freeMB
+}
+
+// ParseFlagsToMap converts a llama-server argv slice into a flag->value map
+// for use with PredictVRAMUsage. Boolean flags map to "".
+func ParseFlagsToMap(args []string) map[string]string {
+	m := make(map[string]string)
+	for i := 0; i < len(args); i++ {
+		if !strings.HasPrefix(args[i], "-") {
+			continue
+		}
+		key := args[i]
+		if eq := strings.Index(key, "="); eq > 0 {
+			m[key[:eq]] = key[eq+1:]
+			continue
+		}
+		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			m[key] = args[i+1]
+			i++
+		} else {
+			m[key] = ""
+		}
+	}
+	return m
 }

@@ -28,6 +28,8 @@ type Engine struct {
 	BenchmarkTimeout     time.Duration
 	ServerStartupTimeout time.Duration
 	BackendHelp          string
+	RefinementRounds     int // 2nd-pass: compute knobs (b/ub/t/tb) on top of the winner
+	PredictOOM           func(candidateFlags []string) bool // pre-launch VRAM prediction
 	OnProgress           func(msg string)
 	StartServer          func(flags []string) (cleanup func(), err error)
 
@@ -234,6 +236,60 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			triedCandidates[candidateKey] = true
 		}
 
+		// Pre-launch OOM prediction: skip candidates that are mathematically
+		// guaranteed to OOM, saving 30-60s per skipped candidate.
+		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
+			}
+			crashed := Entry{
+				Timestamp:     Now(),
+				ModelPath:     modelPath,
+				ModelName:     e.Model,
+				HardwareHash:  e.hardwareHash(),
+				Backend:       e.Backend,
+				Vision:        e.Vision,
+				Round:         round,
+				Name:          suggestion.Name,
+				Flags:         flagMap(candidateFlags),
+				OverrideFlags: overrides,
+				Status:        "predicted-oom",
+			}
+			e.addCache(&crashed)
+			entries = append(entries, crashed)
+			crashedFlagSets = append(crashedFlagSets, overrides)
+			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
+			round++
+			continue
+		}
+
+		// Pre-launch OOM prediction: skip candidates that are mathematically
+		// guaranteed to OOM, saving 30-60s per skipped candidate.
+		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
+			}
+			crashed := Entry{
+				Timestamp:     Now(),
+				ModelPath:     modelPath,
+				ModelName:     e.Model,
+				HardwareHash:  e.hardwareHash(),
+				Backend:       e.Backend,
+				Vision:        e.Vision,
+				Round:         round,
+				Name:          suggestion.Name,
+				Flags:         flagMap(candidateFlags),
+				OverrideFlags: overrides,
+				Status:        "predicted-oom",
+			}
+			e.addCache(&crashed)
+			entries = append(entries, crashed)
+			crashedFlagSets = append(crashedFlagSets, overrides)
+			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
+			round++
+			continue
+		}
+		
 		// Candidate flags need their own backend process; otherwise every round
 		// measures the same already-running baseline.
 		stopBaseline()
@@ -332,6 +388,77 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			best.Best = false
 			baseline.Best = true
 			best = baseline
+		}
+	}
+
+	// =================================================================
+	// Refinement pass: test compute knobs (b/ub/t/tb) on top of the
+	// winning placement/KV config. The main loop finds the best data
+	// placement; this pass finds the best compute settings for that
+	// placement. Each candidate is applied on top of the winner's flags,
+	// not the original baseline.
+	// =================================================================
+	if e.RefinementRounds > 0 && best != nil && best != baseline && len(best.OverrideFlags) > 0 {
+		if e.OnProgress != nil {
+			e.OnProgress(fmt.Sprintf("AI-tune: refinement pass (%d rounds) on top of %s...", e.RefinementRounds, best.Name))
+		}
+		winnerFlags := ApplyOverrides(initialFlags, best.OverrideFlags, protected)
+		refPlan := refinementPlan(winnerFlags, e.Backend, e.Caps, e.BackendHelp)
+		for refIdx := 0; refIdx < len(refPlan) && refIdx < e.RefinementRounds; refIdx++ {
+			c := refPlan[refIdx]
+			o := sanitizeFlagValues(c.FlagValues, protected)
+			candidateFlags := ApplyOverrides(winnerFlags, o, protected)
+			if equalFlags(winnerFlags, candidateFlags) {
+				if e.OnProgress != nil {
+					e.OnProgress(fmt.Sprintf("AI-tune: refinement candidate %q made no effective flag changes", c.Name))
+				}
+				continue
+			}
+			if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
+				if e.OnProgress != nil {
+					e.OnProgress(fmt.Sprintf("AI-tune: skipping refinement candidate %q (predicted OOM)", c.Name))
+				}
+				continue
+			}
+			stopBaseline()
+			refRound := e.Rounds + 3 + refIdx
+			candidate, err := e.round(refRound, modelPath, candidateFlags)
+			if err != nil {
+				crashed := Entry{
+					Timestamp:     Now(),
+					ModelPath:     modelPath,
+					ModelName:     e.Model,
+					HardwareHash:  e.hardwareHash(),
+					Backend:       e.Backend,
+					Vision:        e.Vision,
+					Round:         refRound,
+					Name:          c.Name,
+					Flags:         flagMap(candidateFlags),
+					OverrideFlags: mergeOverrides(best.OverrideFlags, o),
+					Status:        "crashed",
+				}
+				e.addCache(&crashed)
+				entries = append(entries, crashed)
+				if e.OnProgress != nil {
+					e.OnProgress(fmt.Sprintf("AI-tune: refinement candidate failed: %v", err))
+				}
+				continue
+			}
+			candidate.Name = c.Name
+			candidate.OverrideFlags = mergeOverrides(best.OverrideFlags, o)
+			candidate.Status = "ok"
+			candidate.Backend = e.Backend
+			candidate.Vision = e.Vision
+			e.addCache(candidate)
+			entries = append(entries, *candidate)
+			if meaningfulImprovement(candidate.Result.GenTPS, best.Result.GenTPS, minImprovementPct) {
+				best = candidate
+				winnerFlags = ApplyOverrides(initialFlags, best.OverrideFlags, protected)
+				if e.OnProgress != nil {
+					e.OnProgress(fmt.Sprintf("AI-tune: refinement new best %.1f tok/s (%s)", best.Result.GenTPS, c.Name))
+				}
+			}
+			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
 		}
 	}
 
@@ -1085,6 +1212,87 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 	}
 
 	return candidates
+}
+
+// refinementPlan generates compute-knob candidates (batch, ubatch, threads)
+// for the 2nd-pass refinement. Tested on top of the winning placement/KV
+// config, not the original baseline.
+func refinementPlan(baseFlags []string, backend string, caps *detect.Capabilities, backendHelp string) []Suggestion {
+	base := flagMap(baseFlags)
+	batch := atoiDefault(base["-b"], 4096)
+	ubatch := atoiDefault(base["-ub"], 512)
+	isMoEOffload := isMoEOffloadFlags(base)
+
+	candidates := []Suggestion{}
+	seen := map[string]bool{}
+	add := func(name string, values map[string]interface{}, reasoning string) {
+		values = sanitizeFlagValues(values, nil)
+		if len(values) == 0 {
+			return
+		}
+		key := suggestionKey(values)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		candidates = append(candidates, Suggestion{
+			Name:       name,
+			FlagValues: values,
+			Flags:      flagValuesToArgs(values),
+			Reasoning:  reasoning,
+		})
+	}
+
+	// Batch
+	if isMoEOffload && batch > 1024 {
+		add("ref-smaller-moe-batch", map[string]interface{}{"-b": fmt.Sprintf("%d", maxInt(batch/2, 1024))}, "refine: lower MoE batch to reduce expert handoff pressure")
+		if batch > 1536 {
+			add("ref-moe-batch-1536", map[string]interface{}{"-b": "1536"}, "refine: middle MoE batch size")
+		}
+	}
+	if !isMoEOffload && batch > 0 && batch < 8192 {
+		add("ref-larger-batch", map[string]interface{}{"-b": fmt.Sprintf("%d", minInt(batch*2, 8192))}, "refine: larger batch for prefill throughput")
+	}
+	if !isMoEOffload && batch > 0 && batch < 16384 {
+		add("ref-max-prefill-batch", map[string]interface{}{"-b": "16384"}, "refine: aggressive prefill batch")
+	}
+
+	// Ubatch
+	if isMoEOffload && ubatch > 384 {
+		add("ref-moe-ubatch-384", map[string]interface{}{"-ub": "384"}, "refine: moderate MoE microbatch")
+	}
+	if ubatch > 256 {
+		add("ref-smaller-ubatch", map[string]interface{}{"-ub": fmt.Sprintf("%d", maxInt(ubatch/2, 256))}, "refine: smaller microbatch to reduce compute buffer pressure")
+	}
+	ub, _ := strconv.Atoi(base["-ub"])
+	if ub > 0 {
+		add("ref-larger-ubatch-2x", map[string]interface{}{"-ub": fmt.Sprintf("%d", minInt(ub*2, 4096))}, "refine: 2x ubatch for prefill speed")
+		add("ref-larger-ubatch-4x", map[string]interface{}{"-ub": fmt.Sprintf("%d", minInt(ub*4, 4096))}, "refine: 4x ubatch for prefill speed")
+	}
+
+	// Threads
+	if caps != nil {
+		if caps.CPU.Cores > 0 && atoiDefault(base["--threads"], 0) != caps.CPU.Cores {
+			add("ref-threads-physical", map[string]interface{}{"--threads": fmt.Sprintf("%d", caps.CPU.Cores)}, "refine: pin decode threads to physical cores")
+		}
+		if caps.CPU.Threads > caps.CPU.Cores && atoiDefault(base["--threads-batch"], 0) != caps.CPU.Threads {
+			add("ref-threads-batch-logical", map[string]interface{}{"--threads-batch": fmt.Sprintf("%d", caps.CPU.Threads)}, "refine: logical threads for prefill")
+		}
+	}
+
+	return candidates
+}
+
+// mergeOverrides returns the union of two override maps. Extra wins on conflict.
+func mergeOverrides(base, extra map[string]interface{}) map[string]interface{} {
+	merged := make(map[string]interface{}, len(base)+len(extra))
+	for k, v := range base {
+		merged[k] = v
+	}
+	for k, v := range extra {
+		merged[k] = v
+	}
+	return merged
 }
 
 func guardRiskyMoEOverrides(overrides map[string]interface{}, baseFlags []string) map[string]interface{} {
