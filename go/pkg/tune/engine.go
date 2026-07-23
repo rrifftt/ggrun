@@ -1025,8 +1025,8 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 	// =================================================================
 	if flagPresent(base, "--no-kv-offload") && hasTurbo {
 		add("gpu-kv-turbo4",
-			map[string]interface{}{"--no-kv-offload": false, "--cache-type-k": "turbo4", "--cache-type-v": "turbo3", "--flash-attn": true, "--fit": "on"},
-			"test GPU KV + turbo4 + flash-attn + fit to reclaim GPU speed on constrained VRAM")
+				map[string]interface{}{"--no-kv-offload": false, "--cache-type-k": "turbo4", "--cache-type-v": "turbo3", "--flash-attn": true, "--fit": "on"},
+				"test GPU KV + turbo4 + flash-attn to reclaim GPU speed on constrained VRAM")
 		if !flagPresent(base, "--no-mmap") {
 			add("gpu-kv-no-mmap",
 				map[string]interface{}{"--no-kv-offload": false, "--no-mmap": true},
@@ -1036,12 +1036,12 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 		if batch > 1024 {
 			add("gpu-kv-turbo4-small-batch",
 				map[string]interface{}{"--no-kv-offload": false, "--cache-type-k": "turbo4", "--cache-type-v": "turbo3", "--flash-attn": true, "--fit": "on", "-b": fmt.Sprintf("%d", maxInt(batch/2, 1024))},
-				"test GPU KV + turbo4 + FA + fit with halved batch to fit constrained VRAM")
+				"test GPU KV + turbo4 + FA with halved batch to fit constrained VRAM")
 		}
 		if ubatch > 256 {
 			add("gpu-kv-turbo4-small-ubatch",
 				map[string]interface{}{"--no-kv-offload": false, "--cache-type-k": "turbo4", "--cache-type-v": "turbo3", "--flash-attn": true, "--fit": "on", "-ub": fmt.Sprintf("%d", maxInt(ubatch/2, 256))},
-				"test GPU KV + turbo4 + FA + fit with halved ubatch to fit constrained VRAM")
+				"test GPU KV + turbo4 + FA with halved ubatch to fit constrained VRAM")
 		}
 	}
 	if !flagPresent(base, "--no-kv-offload") && hasTurbo {

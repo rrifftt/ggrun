@@ -175,7 +175,8 @@ type Options struct {
 	RamBudgetMB     int
 	VRAMHeadroomMB  int    // hold back this much total VRAM as a safety margin
 	RAMHeadroomMB   int    // hold back this much system RAM as a safety margin
-	BackendTag      string // "llama" or "ik_llama"
+	BackendTag      string
+	BackendHelp     string // backend --help output; gates turbo KV types // "llama" or "ik_llama"
 	BackendCacheTag string // backend identity for probe/cache isolation; defaults to BackendTag
 	BackendIdentity string // exact backend build/commit identity for speculative performance profiles
 	SamplingProfile string // default, greedy, recommended, or a hash of explicit sampling overrides
@@ -187,7 +188,6 @@ type Options struct {
 	VisionAuto      bool   // auto-detect mmproj for vision
 	MMProjPath      string // explicit vision projector GGUF
 	SpecMode        string // off, auto, draft, eagle3, dflash, ngram, ngram-mod, ngram-k4v, mtp
-	BackendHelp     string // llama-server --help output for dialect-specific flags
 
 	// SpecCandidateValidator asks the selected backend to load a proposed
 	// companion without allocating model buffers. GGUF metadata establishes
@@ -336,6 +336,17 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			perGPUOH := perGPUVRAMOverheadMB(sysProbe, 0)
 			kvNeedMB := computeKVTotalMB(model, s.ContextSize, s.KVType)
 			s.KVPlacement = resolveAutoKVPlacement(caps, model, totalSizeMB, kvNeedMB, perGPUOH*len(caps.GPUs))
+			// Before accepting CPU KV, try progressively smaller KV types
+			// (quality-first: gentlest reduction that fits). KV on GPU is
+			// always faster than KV on CPU (~10x bandwidth advantage).
+			if s.KVPlacement == "cpu" {
+				if ktK, ktV, fits := tryKVDowngradeForGPU(caps, model, totalSizeMB, perGPUOH*len(caps.GPUs), s.ContextSize, s.KVType, opts.BackendHelp); fits {
+					s.KVType = ktK
+					s.KVTypeK = ktK
+					s.KVTypeV = ktV
+					s.KVPlacement = "gpu"
+				}
+			}
 		}
 	}
 
@@ -3035,6 +3046,72 @@ func computeAutoContextSizeSingleGPU(caps *detect.Capabilities, model *ModelProf
 // A big MoE whose experts must offload to CPU puts KV on CPU instead: that frees
 // VRAM for more expert layers (the decode-bandwidth bottleneck) and unlocks a much
 // larger context. A dense model bigger than VRAM keeps KV on GPU (its only spot).
+// tryKVDowngradeForGPU finds the highest-quality KV cache type combination
+// that keeps KV on GPU when the current type doesn't fit. KV on GPU is
+// always faster than KV on CPU (~10x bandwidth advantage), but aggressive
+// quantization degrades model output quality. This function tries the
+// gentlest reduction first (preserving K quality, then V) and only goes
+// more aggressive if needed.
+//
+// For MoE models, only non-expert weights (attention, norms, embeddings)
+// are checked against the VRAM budget — expert FFN weights live on CPU
+// via --n-cpu-moe and don't compete for VRAM.
+//
+// Returns (kvTypeK, kvTypeV, fitsOnGPU). kvTypeV empty means symmetric.
+func tryKVDowngradeForGPU(caps *detect.Capabilities, model *ModelProfile, totalSizeMB, vramOverheadMB, ctxSize int, currentKVType, backendHelp string) (string, string, bool) {
+	freeVRAM := 0
+	for _, g := range caps.GPUs {
+		freeVRAM += g.VRAMFreeMB()
+	}
+	if freeVRAM <= 0 {
+		return currentKVType, "", false
+	}
+	fitOnGPU := int(float64(freeVRAM-vramOverheadMB) / 0.90)
+
+	// VRAM the model occupies on GPU. For MoE, only non-expert weights
+	// (attention, norms, embeddings) are GPU-resident; expert FFN weights
+	// are on CPU via --n-cpu-moe.
+	modelOnGPU := totalSizeMB
+	if model.IsMoE && model.NonExpertBytes > 0 {
+		modelOnGPU = bytesToMiBCeil(model.NonExpertBytes)
+	}
+	if modelOnGPU > fitOnGPU {
+		return currentKVType, "", false
+	}
+
+	// Quality-first ladder: gentlest reduction first. Keys are more
+	// quantization-sensitive than values, so we keep K at higher quality
+	// and compress V more aggressively before touching K.
+	type kvCombo struct{ k, v string }
+	combos := []kvCombo{
+		{"q8_0", "q5_1"},  // K lossless, gentle V reduction    (~15% savings)
+		{"q8_0", "q4_1"},  // K lossless, moderate V reduction  (~21%)
+		{"q8_0", "q4_0"},  // K lossless, aggressive V          (~24%)
+		{"q5_1", "q4_1"},  // gentle K, moderate V              (~35%)
+		{"q5_0", "q4_0"},  // moderate both                     (~41%)
+		{"q4_0", "q4_0"},  // aggressive both, smallest universal (~47%)
+	}
+	// Turbo types are gated on backend support (turboquant forks only).
+	// Placed last: they save the most VRAM but quality is backend-dependent.
+	if strings.Contains(backendHelp, "turbo") {
+		combos = append(combos,
+			kvCombo{"turbo4", "turbo4"}, // symmetric turbo  (~53%)
+			kvCombo{"turbo4", "turbo3"}, // asymmetric turbo (~59%)
+		)
+	}
+	for _, c := range combos {
+		// Skip if this combo isn't a downgrade from the current type
+		if c.k == currentKVType && c.v == currentKVType {
+			continue
+		}
+		tryKVMB := computeKVTotalMBAsymmetric(model, ctxSize, c.k, c.v)
+		if modelOnGPU+tryKVMB <= fitOnGPU {
+			return c.k, c.v, true
+		}
+	}
+	return currentKVType, "", false
+}
+
 func resolveAutoKVPlacement(caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB, vramOverheadMB int) string {
 	freeVRAM := 0
 	for _, g := range caps.GPUs {
@@ -4628,6 +4705,11 @@ func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect
 	for _, g := range caps.GPUs {
 		freeMB += g.VRAMFreeMB()
 	}
+	// --fit on lets the backend auto-offload layers to fit KV on GPU.
+	// Don't predict OOM for these configs — let the backend handle it.
+	if _, ok := flags["--fit"]; ok {
+		return 0, freeMB
+	}
 
 	// 1. Model weights on GPU
 	ncpuMoe := 0
@@ -4652,17 +4734,17 @@ func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect
 	}
 
 	// 2. KV cache on GPU
+	ctxSize := model.ContextSize
+	if v, ok := flags["--ctx-size"]; ok {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			ctxSize = n
+		}
+	}
 	kvOnGPU := true
 	if _, ok := flags["--no-kv-offload"]; ok {
 		kvOnGPU = false
 	}
 	if kvOnGPU {
-		ctxSize := model.ContextSize
-		if v, ok := flags["--ctx-size"]; ok {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				ctxSize = n
-			}
-		}
 		kvType := "f16"
 		if v, ok := flags["--cache-type-k"]; ok && v != "" {
 			kvType = v
@@ -4670,14 +4752,15 @@ func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect
 		neededMB += computeKVTotalMB(model, ctxSize, kvType)
 	}
 
-	// 3. Compute buffer (scales with ubatch)
-	ubatch := 512
-	if v, ok := flags["-ub"]; ok {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			ubatch = n
-		}
+	// Compute buffer: empirical estimate from llama.cpp measurements.
+	// ~330 MB at 65536 ctx on a 9B model, scales linearly with context.
+	// firstLaunchComputeBufMB overestimates by 6x (it sizes for the
+	// initial graph allocation spike, not steady-state).
+	computeMB := ctxSize / 200
+	if computeMB < 128 {
+		computeMB = 128
 	}
-	neededMB += firstLaunchComputeBufMB(model, ubatch)
+	neededMB += computeMB
 
 	// 4. CUDA overhead (per-GPU context, ~200-500 MB)
 	neededMB += 300
