@@ -238,6 +238,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 
 		// Pre-launch OOM prediction: skip candidates that are mathematically
 		// guaranteed to OOM, saving 30-60s per skipped candidate.
+		fmt.Printf("[DEBUG] PredictOOM nil=%v flags=%v\n", e.PredictOOM == nil, candidateFlags[:min(5, len(candidateFlags))])
 		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
 			if e.OnProgress != nil {
 				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
@@ -265,6 +266,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 
 		// Pre-launch OOM prediction: skip candidates that are mathematically
 		// guaranteed to OOM, saving 30-60s per skipped candidate.
+		fmt.Printf("[DEBUG] PredictOOM nil=%v flags=%v\n", e.PredictOOM == nil, candidateFlags[:min(5, len(candidateFlags))])
 		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
 			if e.OnProgress != nil {
 				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
