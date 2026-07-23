@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,7 +47,7 @@ func main() {
 		usage()
 	case "detect":
 		cmdDetect()
-			case "dry-run":
+	case "dry-run":
 		cmdDryRun(args[1:])
 	case "probe":
 		cmdProbe()
@@ -58,7 +57,7 @@ func main() {
 		cmdTune(args[1:])
 	case "spec-test":
 		cmdSpecTest(args[1:])
-		default:
+	default:
 		usage()
 		os.Exit(2)
 	}
@@ -455,7 +454,7 @@ func parseLaunchArgs(args []string) (*launchRequest, error) {
 			req.Host = v
 		case "--vision":
 			req.VisionAuto = true
-				case "--no-mmap":
+		case "--no-mmap":
 			req.NoMMap = true
 		case "--mmproj":
 			v, err := next()
@@ -890,8 +889,8 @@ func placementOptionsFromRequest(req *launchRequest, model *placement.ModelProfi
 		NoMMap:                 req.NoMMap,
 		CacheDir:               cacheDir,
 		Host:                   req.Host,
-        BackendTag:             backendDialect(be),
-        BackendHelp:            be.Help,
+		BackendTag:             backendDialect(be),
+		BackendHelp:            be.Help,
 		BackendCacheTag:        be.Tag,
 		BackendIdentity:        be.Identity,
 		SamplingProfile:        requestSamplingProfile(req, model),
@@ -924,6 +923,7 @@ func requestSamplingProfile(req *launchRequest, model *placement.ModelProfile) s
 	sum := sha256.Sum256([]byte(strings.Join(values, "\x00")))
 	return fmt.Sprintf("custom-%x", sum[:8])
 }
+
 // prompt (~15-20k tokens) and requests truncate or fail outright.
 func buildLaunchServerArgs(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, strategy *placement.Strategy) []string {
 	if req.SpecDraftMax > 0 && strategy != nil && strategy.Draft != nil && strategy.Draft.Type != placement.DraftNone {
@@ -982,32 +982,6 @@ func measuredPromotionOptions(req *launchRequest, model *placement.ModelProfile,
 	opts := placementOptionsFromRequest(req, model, be, cacheDir)
 	opts.SkipPlacementCache = true
 	return opts
-}
-
-func maybePromoteMeasuredPlacement(req *launchRequest, cfg *config.Config, be *backendInfo, caps *detect.Capabilities, model *placement.ModelProfile, current *placement.Strategy, currentArgs []string) (*placement.Strategy, []string, bool) {
-	if req == nil || cfg == nil || be == nil || caps == nil || model == nil || current == nil || !model.IsMoE || len(caps.GPUs) == 0 {
-		return nil, nil, false
-	}
-	// A measured KV probe may have been written after the first load. Force the
-	// recompute to reload it instead of reusing the pre-launch model struct state.
-	// Also bypass the placement cache: reloading the placement that just launched
-	// made this calibration pass incapable of filling newly proven free VRAM.
-	// a safe but sparse five-block cache kept winning even when six blocks fit.
-	model.MeasuredKVBytesPerTok = nil
-	opts := measuredPromotionOptions(req, model, be, cfg.CacheDir)
-	next, err := placement.Compute(caps, model, opts)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[launch] calibration: measured placement recompute failed: %v\n", err)
-		return nil, nil, false
-	}
-	if !shouldPromoteMoEPlacement(current, next) {
-		return nil, nil, false
-	}
-	nextArgs := buildLaunchServerArgs(req, cfg, be, caps, model, next)
-	if formatCommand(nextArgs) == formatCommand(currentArgs) {
-		return nil, nil, false
-	}
-	return next, nextArgs, true
 }
 
 func startLaunchWithCUDAOOMRecovery(req *launchRequest, cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, serverArgs []string, timeout time.Duration) (*server.Process, *placement.Strategy, []string, error) {
@@ -1258,40 +1232,8 @@ func runtimeLogCUDAOOM(logData string, caps *detect.Capabilities, prior map[int]
 	return 0, 0, false, false
 }
 
-func oomLogFingerprint(logData string) string {
-	sum := sha256.Sum256([]byte(logData))
-	return fmt.Sprintf("%x", sum[:])
-}
-
 // recordRuntimeOOMLog records either the exact failed allocation or the
 // exit from being counted again when its previous log is recovered next run.
-func recordRuntimeOOMLog(cfg *config.Config, model *placement.ModelProfile, strategy *placement.Strategy, be *backendInfo, caps *detect.Capabilities, logData, markerPath string) (device, reserveMB int, estimated, changed, ok bool, err error) {
-	if cfg == nil || model == nil || strategy == nil || be == nil || caps == nil {
-		return 0, 0, false, false, false, nil
-	}
-	fingerprint := oomLogFingerprint(logData)
-	if markerPath != "" {
-		if data, readErr := os.ReadFile(markerPath); readErr == nil && strings.TrimSpace(string(data)) == fingerprint {
-			return 0, 0, false, false, false, nil
-		}
-	}
-	prior := placement.RuntimeGraphGrowthByGPU(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, be.Tag, caps.GPUs, strategy.Parallel)
-	device, reserveMB, estimated, ok = runtimeLogCUDAOOM(logData, caps, prior)
-	if !ok {
-		return 0, 0, false, false, false, nil
-	}
-	if err = placement.RecordRuntimeGraphGrowthFromOOM(cfg.CacheDir, model, strategy.ContextSize, strategy.UBatchSize, strategy.KVQuality, strategy.KVPlacement, be.Tag, caps.GPUs, strategy.Parallel, device, reserveMB); err != nil {
-		return device, reserveMB, estimated, false, true, err
-	}
-	changed = reserveMB > prior[device]
-	if markerPath != "" {
-		if err = os.WriteFile(markerPath, []byte(fingerprint+"\n"), 0600); err != nil {
-			return device, reserveMB, estimated, changed, true, err
-		}
-	}
-	return device, reserveMB, estimated, changed, true, nil
-}
-
 func applyDeratedPlacementEntry(strategy *placement.Strategy, entry *placement.CacheEntry) {
 	if strategy == nil || entry == nil {
 		return
@@ -1738,11 +1680,8 @@ func cmdKVProbe(args []string) {
 		os.Exit(1)
 	}
 	be := selectBackend(caps, req)
-	binPath := "llama-server"
-	if be != nil {
-		binPath = be.Path
-	} else {
-		be = &backendInfo{Path: binPath, Tag: "llama"}
+	if be == nil {
+		be = &backendInfo{Path: "llama-server", Tag: "llama"}
 	}
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
 	if err != nil {
@@ -1790,13 +1729,11 @@ func cmdDryRun(args []string) {
 
 	be := selectBackend(caps, req)
 	be = routeArchBackend(be, model, req)
-	backendTag := "llama"
 	binPath := "llama-server"
 	if be != nil {
 		binPath = be.Path
-		backendTag = backendDialect(be)
 	} else {
-		be = &backendInfo{Path: binPath, Tag: backendTag}
+		be = &backendInfo{Path: binPath, Tag: "llama"}
 	}
 
 	strategy, err := placement.Compute(caps, model, placementOptionsFromRequest(req, model, be, cfg.CacheDir))
@@ -1882,44 +1819,8 @@ func patchPlacementArgs(args []string, s *placement.Strategy) []string {
 // waitForHealth polls the server's /health (then /v1/models) until it answers or
 // the timeout elapses. Used by the TUI path, where the backend starts in a
 // background goroutine and there's no synchronous readiness signal.
-func waitForHealth(host string, port int, timeout time.Duration) bool {
-	clientHost := host
-	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
-		clientHost = "127.0.0.1"
-	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		for _, path := range []string{"/health", "/v1/models"} {
-			resp, err := client.Get(fmt.Sprintf("http://%s:%d%s", clientHost, port, path))
-			if err == nil {
-				resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					return true
-				}
-			}
-		}
-		time.Sleep(time.Second)
-	}
-	return false
-}
-
 // isServerRunning returns true if the server at host:port responds to /health
 // with 200 OK within a short timeout.
-func isServerRunning(host string, port int) bool {
-	clientHost := host
-	if clientHost == "" || clientHost == "0.0.0.0" || clientHost == "::" {
-		clientHost = "127.0.0.1"
-	}
-	client := &http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get(fmt.Sprintf("http://%s:%d/health", clientHost, port))
-	if err != nil {
-		return false
-	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
-}
-
 func cmdShowConfigs(args []string) {
 	cfg := loadConfigOrExit()
 	modelName := ""

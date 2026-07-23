@@ -100,9 +100,9 @@ type Strategy struct {
 	MaxCheckpoints int  `json:"max_checkpoints,omitempty"`
 	UseCUDAGraphs  bool `json:"use_cuda_graphs,omitempty"`
 
-	Host    string `json:"host,omitempty"`    // listen address
-	HasSSM  bool   `json:"has_ssm,omitempty"` // SSM/Mamba hybrid flag
-	Draft   *DraftConfig `json:"draft,omitempty"`       // speculative decoding config
+	Host   string       `json:"host,omitempty"`    // listen address
+	HasSSM bool         `json:"has_ssm,omitempty"` // SSM/Mamba hybrid flag
+	Draft  *DraftConfig `json:"draft,omitempty"`   // speculative decoding config
 
 	MMProjPath   string `json:"mmproj_path,omitempty"` // vision projector GGUF
 	MMProjSizeMB int    `json:"-"`                     // mmproj VRAM on primary GPU
@@ -173,8 +173,8 @@ type Options struct {
 	GPUs            []int  // restrict to specific GPUs
 	CPUMode         bool
 	RamBudgetMB     int
-	VRAMHeadroomMB  int    // hold back this much total VRAM as a safety margin
-	RAMHeadroomMB   int    // hold back this much system RAM as a safety margin
+	VRAMHeadroomMB  int // hold back this much total VRAM as a safety margin
+	RAMHeadroomMB   int // hold back this much system RAM as a safety margin
 	BackendTag      string
 	BackendHelp     string // backend --help output; gates turbo KV types // "llama" or "ik_llama"
 	BackendCacheTag string // backend identity for probe/cache isolation; defaults to BackendTag
@@ -706,7 +706,7 @@ func buildSingleGPU(s *Strategy, caps *detect.Capabilities, model *ModelProfile,
 		computeBufMB = pc.ComputeBufMB
 	}
 
-		gpuKVMB := kvTotalMB
+	gpuKVMB := kvTotalMB
 	if s.KVPlacement == "cpu" {
 		gpuKVMB = 0
 	}
@@ -1102,7 +1102,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 			}
 		}
 		if totalWeighted <= 0 {
-			return nil, fmt.Errorf("Model does not fit on this system: no GPU has free VRAM after CUDA/compute overhead")
+			return nil, fmt.Errorf("model does not fit on this system: no GPU has free VRAM after CUDA/compute overhead")
 		}
 		for i, g := range caps.GPUs {
 			if used[i] {
@@ -1276,7 +1276,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 		gapVRAMMB := gap * expertPerLayerMB
 		gapRAMMB := gap * expertPerLayerMB
 		return nil, fmt.Errorf(
-			"Model does not fit on this system.\n"+
+			"model does not fit on this system.\n"+
 				"  Required:    %d MoE layers\n"+
 				"  GPU cap:     %d layers across %d GPU(s)\n"+
 				"  CPU cap:     %d layers (%s)\n"+
@@ -1674,22 +1674,6 @@ func hasMeasuredCUDAOverheadForActiveGPUs(overheadByGPU map[int]int, gpus []dete
 	return true
 }
 
-func splitShareMB(totalMB int, split []float64, idx int) int {
-	if totalMB <= 0 || idx < 0 || idx >= len(split) || split[idx] <= 0 {
-		return 0
-	}
-	totalSplit := 0.0
-	for _, v := range split {
-		if v > 0 {
-			totalSplit += v
-		}
-	}
-	if totalSplit <= 0 {
-		return 0
-	}
-	return int(math.Ceil(float64(totalMB) * split[idx] / totalSplit))
-}
-
 // ReplanAfterOOM recomputes the full placement after a cudaMalloc OOM, with the
 // failed device(s) penalized by how much they overshot. Because it re-runs the
 // real packer, the correction is fill-preserving: it refits the failed card
@@ -1940,10 +1924,6 @@ func positiveAssignments(assignments []GPUAssignment) []GPUAssignment {
 
 // buildOTString builds the -ot override-tensor string for MoE.
 // Builds the -ot override-tensor string: explicit layer list with escaped dots.
-func buildOTString(layersPerGPU []int, gpus []detect.GPU, gpuOrder []int, backendTag string) string {
-	return buildOTStringFromStart(layersPerGPU, gpus, gpuOrder, 0, backendTag)
-}
-
 const expertTensorPattern = `ffn_((gate_up|up_gate|gate|up|down)_(ch|)exps|(gate_inp|gate|up|down)_shexp|gate_inp|gate_tid2eid|exp_probs_b)`
 
 func buildOTStringFromStart(layersPerGPU []int, gpus []detect.GPU, gpuOrder []int, startLayer int, backendTag string) string {
@@ -2110,7 +2090,6 @@ func deviceName(backendTag string, index int) string {
 	}
 	return fmt.Sprintf("CUDA%d", index)
 }
-
 
 // computeKVTotalMB calculates exact KV cache size.
 func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string) int {
@@ -2333,14 +2312,6 @@ func NormalizeKVType(value string) (string, error) {
 	}
 }
 
-func kvTypeFromQuality(quality string) string {
-	typeName, err := NormalizeKVType(quality)
-	if err != nil {
-		return "q8_0"
-	}
-	return typeName
-}
-
 func exactKVTypeRequested(quality string) bool {
 	switch strings.ToLower(strings.TrimSpace(quality)) {
 	case "", "high", "mid", "low":
@@ -2348,22 +2319,6 @@ func exactKVTypeRequested(quality string) bool {
 	default:
 		return true
 	}
-}
-
-func kvTypesForAutoContext(preferred, quality string) []string {
-	values := []string{preferred}
-	if !exactKVTypeRequested(quality) {
-		values = append(values, "q8_0", "q4_0")
-	}
-	seen := make(map[string]bool, len(values))
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		if value != "" && !seen[value] {
-			seen[value] = true
-			out = append(out, value)
-		}
-	}
-	return out
 }
 
 func fallbackKVType(preferred, quality string) string {
@@ -2502,22 +2457,6 @@ func seqRange(n int) []int {
 	return r
 }
 
-func orderGPUsByFreeVRAM(gpus []detect.GPU) []int {
-	indices := make([]int, len(gpus))
-	for i := range gpus {
-		indices[i] = i
-	}
-	sort.Slice(indices, func(i, j int) bool {
-		vi := gpus[indices[i]].VRAMFreeMB()
-		vj := gpus[indices[j]].VRAMFreeMB()
-		if vi == vj {
-			return gpus[indices[i]].Index < gpus[indices[j]].Index
-		}
-		return vi > vj
-	})
-	return indices
-}
-
 func normalizeSplit(split []float64) []float64 {
 	var total float64
 	for _, v := range split {
@@ -2637,10 +2576,6 @@ func expertOnlyComputeReserveMB(splitOwnerComputeMB int) int {
 // margin). Replaces the flat 8 GiB guess previously hard-coded in the auto
 // context-size paths so large models reserve enough and small models don't
 // waste context capacity.
-func modelAwareHeadroom(model *ModelProfile) int {
-	return firstLaunchComputeBufMB(model, 512) + 1024
-}
-
 // firstLaunchComputeBufMB is a conservative compute-buffer reservation used until
 // the post-launch probe measures the real value for this model + settings. The
 // prompt-processing graph scales with ubatch AND model shape: activation working
@@ -2685,10 +2620,6 @@ func firstLaunchComputeBufMBParallel(model *ModelProfile, uBatch, parallel int) 
 		est = computeFloorMB
 	}
 	return est
-}
-
-func firstLaunchComputeBufMBForGPU(model *ModelProfile, uBatch, gpuPos int, order []int) int {
-	return firstLaunchComputeBufMBForGPUParallel(model, uBatch, 1, gpuPos, order)
 }
 
 func firstLaunchComputeBufMBForGPUParallel(model *ModelProfile, uBatch, parallel, gpuPos int, order []int) int {
@@ -2827,7 +2758,7 @@ func checkMemoryOrDie(caps *detect.Capabilities, model *ModelProfile, s *Strateg
 			maxCtx = maxKVMB * s.ContextSize / kvTotalMB
 		}
 		msg := fmt.Sprintf(
-			"ERROR: Model does not fit in %s.\n"+
+			"ERROR: model does not fit in %s.\n"+
 				"  Model weights:          %dMB\n"+
 				"  CUDA overhead (%d GPU): %dMB\n"+
 				"  Compute buffers (%d):   %dMB\n"+
@@ -3083,12 +3014,12 @@ func tryKVDowngradeForGPU(caps *detect.Capabilities, model *ModelProfile, totalS
 	// and compress V more aggressively before touching K.
 	type kvCombo struct{ k, v string }
 	combos := []kvCombo{
-		{"q8_0", "q5_1"},  // K lossless, gentle V reduction    (~15% savings)
-		{"q8_0", "q4_1"},  // K lossless, moderate V reduction  (~21%)
-		{"q8_0", "q4_0"},  // K lossless, aggressive V          (~24%)
-		{"q5_1", "q4_1"},  // gentle K, moderate V              (~35%)
-		{"q5_0", "q4_0"},  // moderate both                     (~41%)
-		{"q4_0", "q4_0"},  // aggressive both, smallest universal (~47%)
+		{"q8_0", "q5_1"}, // K lossless, gentle V reduction    (~15% savings)
+		{"q8_0", "q4_1"}, // K lossless, moderate V reduction  (~21%)
+		{"q8_0", "q4_0"}, // K lossless, aggressive V          (~24%)
+		{"q5_1", "q4_1"}, // gentle K, moderate V              (~35%)
+		{"q5_0", "q4_0"}, // moderate both                     (~41%)
+		{"q4_0", "q4_0"}, // aggressive both, smallest universal (~47%)
 	}
 	// Turbo types are gated on backend support (turboquant forks only).
 	// Placed last: they save the most VRAM but quality is backend-dependent.

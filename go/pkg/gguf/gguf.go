@@ -150,20 +150,6 @@ func (s ggufScalar) asUint() (uint64, bool) {
 	return 0, false
 }
 
-func (s ggufScalar) asInt() (int64, bool) {
-	if s.k == scalarInt {
-		return s.i, true
-	}
-	return 0, false
-}
-
-func (s ggufScalar) asFloat() (float64, bool) {
-	if s.k == scalarFloat {
-		return s.f, true
-	}
-	return 0, false
-}
-
 func (s ggufScalar) asString() (string, bool) {
 	if s.k == scalarString {
 		return s.s, true

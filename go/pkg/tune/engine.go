@@ -677,8 +677,6 @@ If current performance is already good, say so with empty flags`,
 	)
 }
 
-
-
 func removeConflicting(flags []string, newFlag string) []string {
 	want := canonicalFlagName(newFlag)
 	result := make([]string, 0, len(flags))
@@ -722,7 +720,6 @@ func QualityProtectedFlags() map[string]bool {
 }
 
 // ApplyOverrides applies a JSON-object tune override set on top of an argv.
-
 
 func applySuggestion(baseFlags, suggested []string) []string {
 	result := make([]string, len(baseFlags))
@@ -933,10 +930,6 @@ func flagArgsToValues(args []string) map[string]interface{} {
 		}
 	}
 	return values
-}
-
-func deterministicSuggestion(round int, baseFlags []string) *Suggestion {
-	return deterministicSuggestionFor(round, baseFlags, "", nil, "")
 }
 
 func deterministicSuggestionFor(round int, baseFlags []string, backend string, caps *detect.Capabilities, backendHelp string) *Suggestion {
@@ -1369,28 +1362,6 @@ func isSkippedDueToOOM(overrides map[string]interface{}, crashedFlagSets []map[s
 		}
 	}
 	return false
-}
-
-func atoiFlagValue(val interface{}, fallback int) int {
-	switch v := val.(type) {
-	case int:
-		if v > 0 {
-			return v
-		}
-	case float64:
-		if v > 0 {
-			return int(v)
-		}
-	case string:
-		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n > 0 {
-			return n
-		}
-	default:
-		if n, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(v))); err == nil && n > 0 {
-			return n
-		}
-	}
-	return fallback
 }
 
 func suggestionKey(values map[string]interface{}) string {

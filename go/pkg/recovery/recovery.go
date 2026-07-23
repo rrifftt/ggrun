@@ -248,14 +248,19 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 		return err
 	}
 
-	stopProgress := func() {}
+	var stopProgress func()
 	if startupLog != nil {
 		stop := make(chan struct{})
 		go spinStartupProgress(stop, startupLog, time.Now(), l.HealthTimeout, cmd.Process.Pid, l.Args)
+		var stopOnce sync.Once
 		stopProgress = func() {
-			close(stop)
-			fmt.Fprint(os.Stderr, "\r\033[K")
+			stopOnce.Do(func() {
+				close(stop)
+				fmt.Fprint(os.Stderr, "\r\033[K")
+			})
 		}
+	} else {
+		stopProgress = func() {}
 	}
 	defer stopProgress()
 
@@ -310,7 +315,6 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				stopProgress()
-				stopProgress = func() {}
 				if startupLog != nil {
 					startupLog.setLive(true)
 					fmt.Fprintf(os.Stderr, "[launch] model loaded - server ready in %s\n", time.Since(startupLog.start).Round(time.Second))
@@ -327,7 +331,6 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 			resp.Body.Close()
 			if resp.StatusCode == 200 {
 				stopProgress()
-				stopProgress = func() {}
 				if startupLog != nil {
 					startupLog.setLive(true)
 					fmt.Fprintf(os.Stderr, "[launch] model loaded - server ready in %s\n", time.Since(startupLog.start).Round(time.Second))

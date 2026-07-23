@@ -1021,10 +1021,6 @@ func hfRepoGGUFArchitectureCompatible(client *http.Client, repo string, target *
 	return specializedArchitectureCompatibleForBackend(target, kind, metadata.GGUF.Architecture, backendTag)
 }
 
-func specializedArchitectureCompatible(target *ModelProfile, kind, candidateArch string) bool {
-	return specializedArchitectureCompatibleForBackend(target, kind, candidateArch, "")
-}
-
 func specializedArchitectureCompatibleForBackend(target *ModelProfile, kind, candidateArch, backendTag string) bool {
 	candidateArch = strings.ToLower(strings.TrimSpace(candidateArch))
 	if candidateArch == "" || candidateArch == "unknown" || target == nil {
@@ -1384,10 +1380,6 @@ func hfCandidateSizeOK(resp *http.Response, target *ModelProfile) bool {
 	return resp.ContentLength <= maxBytes
 }
 
-func hfResolveURL(repo, remotePath string) string {
-	return hfResolveURLAt(repo, remotePath, "main")
-}
-
 func hfResolveURLAt(repo, remotePath, revision string) string {
 	parts := strings.Split(remotePath, "/")
 	for i, part := range parts {
@@ -1456,10 +1448,6 @@ func listRepoDraftCandidates(client *http.Client, repo, kind string) []string {
 		return draftCandidateRank(paths[i], kind) < draftCandidateRank(paths[j], kind)
 	})
 	return paths
-}
-
-func draftFilenameLooksRelevant(name string) bool {
-	return draftFilenameLooksRelevantForKind(name, "draft")
 }
 
 func draftFilenameLooksRelevantForKind(name, kind string) bool {
