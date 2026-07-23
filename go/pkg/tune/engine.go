@@ -1073,7 +1073,7 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 	}
 	add("kv-type-f16", map[string]interface{}{"--cache-type-k": "f16", "--cache-type-v": "f16"}, "test f16 KV cache for max quality")
 	add("kv-type-q8_0", map[string]interface{}{"--cache-type-k": "q8_0", "--cache-type-v": "q8_0"}, "test q8_0 KV cache")
-	add("kv-type-asym-f16-q8", map[string]interface{}{"--cache-type-k": "f16", "--cache-type-v": "q8_0"}, "test asymmetric f16 keys, q8_0 values")
+	add("kv-type-asym-f16-q8", map[string]interface{}{"--cache-type-k": "f16", "--cache-type-v": "q8_0", "--flash-attn": true}, "test asymmetric f16 keys, q8_0 values (FA required for quantized V)")
 
 	// =================================================================
 	// TIER 4: --no-mmap — affects how weights are accessed. Meaningful
