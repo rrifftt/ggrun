@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // Backend is a registered fork backend.
@@ -90,8 +91,21 @@ func ManifestPath() string {
 	return filepath.Join(AppHome(), ".config", "backends.json")
 }
 
+func lockManifest() (*os.File, func(), error) {
+	lockPath := ManifestPath() + ".lock"
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, nil, err
+	}
+	return AcquireLock(lockPath)
+}
+
+// ponytail: global lock per-package; fine-grained per-field locks if throughput matters.
+var manifestMu sync.Mutex
+
 // Load returns the registered fork backends (empty if none/unreadable).
 func Load() []Backend {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
 	data, err := os.ReadFile(ManifestPath())
 	if err != nil {
 		return nil
@@ -105,6 +119,8 @@ func Load() []Backend {
 
 // Save writes the manifest.
 func Save(list []Backend) error {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
 	p := ManifestPath()
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
@@ -118,6 +134,8 @@ func Save(list []Backend) error {
 
 // ByTag returns the registered backend with this tag (case-insensitive), or nil.
 func ByTag(tag string) *Backend {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
 	tag = strings.TrimSpace(strings.ToLower(tag))
 	if tag == "" {
 		return nil
@@ -134,6 +152,8 @@ func ByTag(tag string) *Backend {
 // ForArch returns a registered backend that routes this model architecture,
 // if its binary exists on disk. Case-insensitive on arch.
 func ForArch(arch string) *Backend {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
 	arch = strings.TrimSpace(strings.ToLower(arch))
 	if arch == "" {
 		return nil
@@ -152,6 +172,11 @@ func ForArch(arch string) *Backend {
 
 // Upsert adds or replaces a backend by tag.
 func Upsert(be Backend) error {
+	_, unlock, err := lockManifest()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	list := Load()
 	for i := range list {
 		if strings.EqualFold(list[i].Tag, be.Tag) {
@@ -164,6 +189,11 @@ func Upsert(be Backend) error {
 
 // Remove drops a backend by tag; returns false if not found.
 func Remove(tag string) (bool, error) {
+	_, unlock, err := lockManifest()
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
 	list := Load()
 	out := list[:0:0]
 	found := false
@@ -182,6 +212,8 @@ func Remove(tag string) (bool, error) {
 
 // Tags returns the registered backend tags (for pickers).
 func Tags() []string {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
 	list := Load()
 	tags := make([]string, 0, len(list))
 	for _, b := range list {

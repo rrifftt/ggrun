@@ -2,6 +2,7 @@ package config
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -398,6 +399,14 @@ func parseBool(v string) bool {
 }
 
 // Save writes the config to the canonical config file.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp := path + fmt.Sprintf(".%d.tmp", os.Getpid())
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
 func (c *Config) Save() error {
 	if _, err := ParsePort(strconv.Itoa(c.Port)); err != nil {
 		return fmt.Errorf("PORT: %w", err)
@@ -435,37 +444,32 @@ func (c *Config) Save() error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	fmt.Fprintf(f, "# ggrun configuration\n")
-	fmt.Fprintf(f, "# Precedence: CLI flag > env var > this file > built-in default\n")
-	fmt.Fprintf(f, "LLM_PORT=%d\n", c.Port)
-	fmt.Fprintf(f, "LLM_CTX_SIZE=%q\n", c.CtxValue())
-	fmt.Fprintf(f, "LLM_MAX_RESTARTS=%d\n", c.MaxRestarts)
-	fmt.Fprintf(f, "LLM_KEEP_ALIVE=%d\n", c.KeepAlive)
-	fmt.Fprintf(f, "LLM_HEALTH_TIMEOUT=%d\n", c.HealthTimeout)
-	fmt.Fprintf(f, "LLM_MODEL_DIR=%q\n", c.ModelDir)
-	fmt.Fprintf(f, "LLM_CACHE_DIR=%q\n", c.CacheDir)
-	fmt.Fprintf(f, "LLM_LOG_DIR=%q\n", c.LogDir)
-	fmt.Fprintf(f, "LLM_RAM_BUDGET=%q\n", c.RamBudget)
-	fmt.Fprintf(f, "LLM_VRAM_HEADROOM=%q\n", c.VRAMHeadroom)
-	fmt.Fprintf(f, "LLM_RAM_HEADROOM=%q\n", c.RAMHeadroom)
-	fmt.Fprintf(f, "LLM_KV_PLACEMENT=%q\n", c.KVPlacement)
-	fmt.Fprintf(f, "LLM_KV_QUALITY=%q\n", c.KVQuality)
-	fmt.Fprintf(f, "LLM_ASSUME_YES=%v\n", c.AssumeYes)
-	fmt.Fprintf(f, "LLM_BACKEND=%q\n", c.Backend)
-	fmt.Fprintf(f, "LLAMA_SERVER=%q\n", c.LlamaServer)
-	fmt.Fprintf(f, "LLM_APP_HOME=%q\n", c.AppHome)
-	fmt.Fprintf(f, "LLM_TUNE_ROUNDS=%d\n", c.TuneRounds)
-	fmt.Fprintf(f, "LLM_VISION=%v\n", c.Vision)
-	fmt.Fprintf(f, "LLM_PARALLEL=%d\n", c.Parallel)
-	fmt.Fprintf(f, "LLM_HOST=%q\n", c.Host)
-	fmt.Fprintf(f, "LLM_SPEC=%q\n", c.Spec)
-	return nil
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "# ggrun configuration\n")
+	fmt.Fprintf(&buf, "# Precedence: CLI flag > env var > this file > built-in default\n")
+	fmt.Fprintf(&buf, "LLM_PORT=%d\n", c.Port)
+	fmt.Fprintf(&buf, "LLM_CTX_SIZE=%q\n", c.CtxValue())
+	fmt.Fprintf(&buf, "LLM_MAX_RESTARTS=%d\n", c.MaxRestarts)
+	fmt.Fprintf(&buf, "LLM_KEEP_ALIVE=%d\n", c.KeepAlive)
+	fmt.Fprintf(&buf, "LLM_HEALTH_TIMEOUT=%d\n", c.HealthTimeout)
+	fmt.Fprintf(&buf, "LLM_MODEL_DIR=%q\n", c.ModelDir)
+	fmt.Fprintf(&buf, "LLM_CACHE_DIR=%q\n", c.CacheDir)
+	fmt.Fprintf(&buf, "LLM_LOG_DIR=%q\n", c.LogDir)
+	fmt.Fprintf(&buf, "LLM_RAM_BUDGET=%q\n", c.RamBudget)
+	fmt.Fprintf(&buf, "LLM_VRAM_HEADROOM=%q\n", c.VRAMHeadroom)
+	fmt.Fprintf(&buf, "LLM_RAM_HEADROOM=%q\n", c.RAMHeadroom)
+	fmt.Fprintf(&buf, "LLM_KV_PLACEMENT=%q\n", c.KVPlacement)
+	fmt.Fprintf(&buf, "LLM_KV_QUALITY=%q\n", c.KVQuality)
+	fmt.Fprintf(&buf, "LLM_ASSUME_YES=%v\n", c.AssumeYes)
+	fmt.Fprintf(&buf, "LLM_BACKEND=%q\n", c.Backend)
+	fmt.Fprintf(&buf, "LLAMA_SERVER=%q\n", c.LlamaServer)
+	fmt.Fprintf(&buf, "LLM_APP_HOME=%q\n", c.AppHome)
+	fmt.Fprintf(&buf, "LLM_TUNE_ROUNDS=%d\n", c.TuneRounds)
+	fmt.Fprintf(&buf, "LLM_VISION=%v\n", c.Vision)
+	fmt.Fprintf(&buf, "LLM_PARALLEL=%d\n", c.Parallel)
+	fmt.Fprintf(&buf, "LLM_HOST=%q\n", c.Host)
+	fmt.Fprintf(&buf, "LLM_SPEC=%q\n", c.Spec)
+	return atomicWriteFile(path, buf.Bytes(), 0644)
 }
 
 // Show prints the current config with source attribution.

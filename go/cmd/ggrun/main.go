@@ -793,7 +793,7 @@ func selectBackend(caps *detect.Capabilities, req *launchRequest) *backendInfo {
 	if want != "" && want != "auto" {
 		for _, b := range caps.Backends {
 			info := detectBackend(b.Path)
-			if backendMatches(info, b.Name, want) {
+			if backendMatches(info, b.Tag, want) {
 				return info
 			}
 		}
@@ -2348,7 +2348,7 @@ func resolveCtxFlag(s string, nativeCtx int) int {
 func findBackend(caps *detect.Capabilities) *backendInfo {
 	// Try detected backends first
 	for _, b := range caps.Backends {
-		if b.Name == "llama-server" || b.Name == "ik_llama" || b.Name == "ik_llama-server" {
+		if b.Tag == "llama-server" || b.Tag == "ik_llama" || b.Tag == "ik_llama-server" {
 			return detectBackend(b.Path)
 		}
 	}

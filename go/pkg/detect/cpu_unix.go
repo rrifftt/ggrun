@@ -3,6 +3,7 @@
 package detect
 
 import (
+	"bufio"
 	"os"
 	"os/exec"
 	"runtime"
@@ -23,12 +24,14 @@ func detectPhysicalCores() int {
 	}
 
 	// Linux: parse /proc/cpuinfo for physical cores
-	data, err := os.ReadFile("/proc/cpuinfo")
+	f, err := os.Open("/proc/cpuinfo")
 	if err == nil {
+		defer f.Close()
 		seen := make(map[string]bool)
 		var physID, coreID string
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
 			switch {
 			case strings.HasPrefix(line, "physical id"):
 				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
@@ -70,9 +73,12 @@ func detectRAMFreeMB() int {
 		}
 	}
 	// Linux: /proc/meminfo
-	data, err := os.ReadFile("/proc/meminfo")
+	f, err := os.Open("/proc/meminfo")
 	if err == nil {
-		for _, line := range strings.Split(string(data), "\n") {
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		for scanner.Scan() {
+			line := scanner.Text()
 			if strings.HasPrefix(line, "MemAvailable:") {
 				parts := strings.Fields(line)
 				if len(parts) >= 2 {

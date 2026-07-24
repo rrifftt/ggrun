@@ -19,20 +19,29 @@ type Memory struct {
 
 // Probe checks current free memory on GPUs and system.
 func Probe() (*Memory, error) {
-	gpuFree := probeGPUFree()
-	ramFree := probeRAMFree()
+	gpuFree, gpuErr := probeGPUFree()
+	ramFree, ramErr := probeRAMFree()
+
+	if gpuFree == nil && ramFree <= 0 {
+		if gpuErr != nil && ramErr != nil {
+			return nil, fmt.Errorf("no memory probe source available: GPU %v, RAM %v", gpuErr, ramErr)
+		}
+		return nil, fmt.Errorf("no memory probe source available")
+	}
+
+	// At least one source succeeded — return partial result.
 	return &Memory{
 		GPUFreeMB: gpuFree,
 		RAMFreeMB: ramFree,
 	}, nil
 }
 
-func probeGPUFree() []int {
+func probeGPUFree() ([]int, error) {
 	out, err := exec.Command("nvidia-smi",
 		"--query-gpu=index,memory.free",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var free []int
 	re := regexp.MustCompile(`(\d+),\s*(\d+)`)
@@ -43,22 +52,25 @@ func probeGPUFree() []int {
 			free = append(free, mb)
 		}
 	}
-	return free
+	return free, nil
 }
 
-func probeRAMFree() int {
+func probeRAMFree() (int, error) {
 	if caps, err := detect.Detect(); err == nil && caps.RAM.FreeMB > 0 {
-		return caps.RAM.FreeMB
+		return caps.RAM.FreeMB, nil
 	}
 	if runtime.GOOS != "linux" {
-		return 0
+		return 0, fmt.Errorf("detect failed and not linux, cannot probe RAM")
 	}
 	data, err := exec.Command("awk", "/MemAvailable:/ {print int($2/1024)}", "/proc/meminfo").Output()
 	if err != nil {
-		return 0
+		return 0, err
 	}
 	mb, _ := strconv.Atoi(strings.TrimSpace(string(data)))
-	return mb
+	if mb <= 0 {
+		return 0, fmt.Errorf("meminfo reported zero free RAM")
+	}
+	return mb, nil
 }
 
 // TotalFree returns the sum of free GPU memory.

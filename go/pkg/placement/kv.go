@@ -1,6 +1,8 @@
 package placement
 
 import (
+	"fmt"
+	"os"
 	"strings"
 
 	"github.com/rrifftt/ggrun/pkg/detect"
@@ -15,59 +17,17 @@ func computeKVTotalMB(model *ModelProfile, ctxSize int, kvType string) int {
 		return int(r*float64(ctxSize)/1048576.0 + 0.5)
 	}
 
-	var kvElemsTotal int
-	hasMLA := model.KVLoraRank > 0
-	hasSSM := model.HasSSM == 1
-	hasISWA := model.SlidingWindow > 0
-
-	if hasMLA {
-		// MLA: compressed c^{KV} + RoPE'd key once per layer
-		kvElemsTotal = model.NumLayers * ctxSize * (model.KVLoraRank + model.RopeDim)
-	} else if hasSSM {
-		var attnLayers int
-		if model.FullAttnInterval > 0 {
-			attnLayers = model.NumLayers / model.FullAttnInterval
-			if attnLayers < 1 {
-				attnLayers = 1
-			}
-		} else if model.HeadCountKV == 0 {
-			attnLayers = 0
-		} else {
-			attnLayers = (model.NumLayers + 1) / 2
-		}
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = attnLayers * ctxSize * kvBytesPerLayerPerToken
-	} else if hasISWA {
-		swaPeriod := 6
-		switch model.ModelArch {
-		case "gemma2", "cohere2", "exaone4", "llama4":
-			swaPeriod = 4
-		case "gemma3":
-			swaPeriod = 6
-		case "plamo3":
-			swaPeriod = 8
-		}
-		fullLayers := (model.NumLayers + swaPeriod - 1) / swaPeriod
-		swaLayers := model.NumLayers - fullLayers
-		swaCtx := ctxSize
-		if swaCtx > model.SlidingWindow {
-			swaCtx = model.SlidingWindow
-		}
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = fullLayers*ctxSize*kvBytesPerLayerPerToken + swaLayers*swaCtx*kvBytesPerLayerPerToken
-	} else {
-		// Standard GQA/MQA
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = model.NumLayers * ctxSize * kvBytesPerLayerPerToken
-	}
+	kElems, vElems := kvElemsByArch(model, ctxSize)
+	totalElems := kElems + vElems
 
 	bytesPerElem, ok := kvTypeBytesPerElement(kvType)
 	if !ok {
 		// Compute normally receives a validated type. Preserve the old
 		// conservative q8_0 fallback for direct package callers.
+		fmt.Fprintf(os.Stderr, "[placement] WARNING: unknown KV type %q, using q8_0 fallback\n", kvType)
 		bytesPerElem = 1.0625
 	}
-	return int(float64(kvElemsTotal) * bytesPerElem / 1024 / 1024)
+	return int(float64(totalElems) * bytesPerElem / 1024 / 1024)
 }
 
 func computeKVTotalMBAsymmetric(model *ModelProfile, ctxSize int, kvTypeK, kvTypeV string) int {
@@ -87,29 +47,42 @@ func computeKVTotalMBAsymmetric(model *ModelProfile, ctxSize int, kvTypeK, kvTyp
 		}
 	}
 
-	// 2. Architecture-aware element calculation
+	kElems, vElems := kvElemsByArch(model, ctxSize)
+	bytesPerElemK := kvBytesPerElem(kvTypeK)
+	bytesPerElemV := kvBytesPerElem(kvTypeV)
+	totalBytes := float64(kElems)*bytesPerElemK + float64(vElems)*bytesPerElemV
+	return int(totalBytes/1024/1024 + 0.5)
+}
+
+// kvElemsByArch returns the total K and V elements based on the model's architecture.
+// For symmetric callers, total elements is kElems + vElems.
+func kvElemsByArch(model *ModelProfile, ctxSize int) (kElems, vElems int) {
 	hasMLA := model.KVLoraRank > 0
 	hasSSM := model.HasSSM == 1
 	hasISWA := model.SlidingWindow > 0
 
-	var kvElemsTotal int
 	if hasMLA {
-		kvElemsTotal = model.NumLayers * ctxSize * (model.KVLoraRank + model.RopeDim)
-	} else if hasSSM {
+		// MLA: compressed c^{KV} + RoPE'd key once per layer
+		total := model.NumLayers * ctxSize * (model.KVLoraRank + model.RopeDim)
+		return total / 2, total - (total / 2)
+	}
+
+	if hasSSM {
 		var attnLayers int
 		if model.FullAttnInterval > 0 {
 			attnLayers = model.NumLayers / model.FullAttnInterval
-			if attnLayers < 1 {
-				attnLayers = 1
-			}
+			if attnLayers < 1 { attnLayers = 1 }
 		} else if model.HeadCountKV == 0 {
 			attnLayers = 0
 		} else {
 			attnLayers = (model.NumLayers + 1) / 2
 		}
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = attnLayers * ctxSize * kvBytesPerLayerPerToken
-	} else if hasISWA {
+		kElems = attnLayers * ctxSize * model.HeadCountKV * model.KeyLength
+		vElems = attnLayers * ctxSize * model.HeadCountKV * model.ValueLength
+		return kElems, vElems
+	}
+
+	if hasISWA {
 		swaPeriod := 6
 		switch model.ModelArch {
 		case "gemma2", "cohere2", "exaone4", "llama4":
@@ -125,75 +98,31 @@ func computeKVTotalMBAsymmetric(model *ModelProfile, ctxSize int, kvTypeK, kvTyp
 		if swaCtx > model.SlidingWindow {
 			swaCtx = model.SlidingWindow
 		}
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = fullLayers*ctxSize*kvBytesPerLayerPerToken + swaLayers*swaCtx*kvBytesPerLayerPerToken
-	} else {
-		kvBytesPerLayerPerToken := model.HeadCountKV * (model.KeyLength + model.ValueLength)
-		kvElemsTotal = model.NumLayers * ctxSize * kvBytesPerLayerPerToken
+		kElems = (fullLayers*ctxSize + swaLayers*swaCtx) * model.HeadCountKV * model.KeyLength
+		vElems = (fullLayers*ctxSize + swaLayers*swaCtx) * model.HeadCountKV * model.ValueLength
+		return kElems, vElems
 	}
 
-	// 3. Split elements by architecture
-	var kvElemsK, kvElemsV int
-	if hasMLA {
-		kvElemsK = kvElemsTotal / 2
-		kvElemsV = kvElemsTotal - kvElemsK
-	} else if hasISWA {
-		// ISWA has mixed context sizes (full layers use ctxSize, sliding-window
-		// layers use swaCtx). Compute the K and V totals directly — do NOT
-		// multiply by ctxSize again at the end.
-		swaPeriod := 6
-		switch model.ModelArch {
-		case "gemma2", "cohere2", "exaone4", "llama4":
-			swaPeriod = 4
-		case "gemma3":
-			swaPeriod = 6
-		case "plamo3":
-			swaPeriod = 8
-		}
-		fullLayers := (model.NumLayers + swaPeriod - 1) / swaPeriod
-		swaLayers := model.NumLayers - fullLayers
-		swaCtx := ctxSize
-		if swaCtx > model.SlidingWindow {
-			swaCtx = model.SlidingWindow
-		}
-		kvElemsK = (fullLayers*ctxSize + swaLayers*swaCtx) * model.HeadCountKV * model.KeyLength
-		kvElemsV = (fullLayers*ctxSize + swaLayers*swaCtx) * model.HeadCountKV * model.ValueLength
-	} else {
-		var kvElemsPerTokenK, kvElemsPerTokenV int
-		if hasSSM {
-			var attnLayers int
-			if model.FullAttnInterval > 0 {
-				attnLayers = model.NumLayers / model.FullAttnInterval
-				if attnLayers < 1 {
-					attnLayers = 1
-				}
-			} else if model.HeadCountKV == 0 {
-				attnLayers = 0
-			} else {
-				attnLayers = (model.NumLayers + 1) / 2
-			}
-			kvElemsPerTokenK = attnLayers * model.HeadCountKV * model.KeyLength
-			kvElemsPerTokenV = attnLayers * model.HeadCountKV * model.ValueLength
-		} else {
-			kvElemsPerTokenK = model.NumLayers * model.HeadCountKV * model.KeyLength
-			kvElemsPerTokenV = model.NumLayers * model.HeadCountKV * model.ValueLength
-		}
-		kvElemsK = kvElemsPerTokenK * ctxSize
-		kvElemsV = kvElemsPerTokenV * ctxSize
-	}
-
-	bytesPerElemK := kvBytesPerElem(kvTypeK)
-	bytesPerElemV := kvBytesPerElem(kvTypeV)
-	totalBytes := float64(kvElemsK)*bytesPerElemK + float64(kvElemsV)*bytesPerElemV
-	return int(totalBytes/1024/1024 + 0.5)
+	// Standard GQA/MQA
+	kElems = model.NumLayers * ctxSize * model.HeadCountKV * model.KeyLength
+	vElems = model.NumLayers * ctxSize * model.HeadCountKV * model.ValueLength
+	return kElems, vElems
 }
 
-func parseKVType(kvType string) (string, string, string) {
+func parseKVType(kvType string) (string, string) {
 	if strings.Contains(kvType, "-") {
 		parts := strings.SplitN(kvType, "-", 2)
-		return parts[0], parts[0], parts[1] // base, K, V
+		return parts[0], parts[1] // K, V
 	}
-	return kvType, kvType, kvType
+	return kvType, kvType
+}
+
+// kvTypeCombined returns the combined KV type string (e.g. "q8_0" or "q8_0-q5_1").
+func kvTypeCombined(kType, vType string) string {
+	if kType == vType {
+		return kType
+	}
+	return kType + "-" + vType
 }
 
 func resolveAutoKVPlacement(caps *detect.Capabilities, model *ModelProfile, totalSizeMB, kvTotalMB, vramOverheadMB int) string {

@@ -31,8 +31,8 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 
 	// Single-GPU / CPU-only CRAM
 	cram := ramAfterLoad / 10
-	if cram > 16384 {
-		cram = 16384
+	if cram > cramCapMB {
+		cram = cramCapMB
 	}
 	if cram < minCramMB {
 		cram = 0
@@ -60,8 +60,8 @@ func computeCRAM(caps *detect.Capabilities, model *ModelProfile, s *Strategy, to
 			vramHeadroom = 0
 		}
 		cacheRAMMB := vramHeadroom / 2
-		if cacheRAMMB > 4096 {
-			cacheRAMMB = 4096
+		if cacheRAMMB > cacheRAMCapMB {
+			cacheRAMMB = cacheRAMCapMB
 		}
 		if cacheRAMMB < 256 {
 			cacheRAMMB = 0

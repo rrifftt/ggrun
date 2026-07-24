@@ -163,6 +163,56 @@ func TestTryKVDowngradeForGPU_TurboGatedOnBackend(t *testing.T) {
 	}
 }
 
+func TestPredictVRAMUsage_MoEOverheadDecoupledFromTotalSize(t *testing.T) {
+	caps := testCaps()
+	model := testMoEModel()
+	// Model: TotalSizeMB=16465, NonExpertBytes=1560*1024*1024,
+	//        ExpertBytes=14894*1024*1024, NumLayers=40
+	// With --n-cpu-moe=32: gpuExpertLayers=8
+	//
+	// This test verifies that the MoE branch correctly uses the overhead
+	// (CUDA + compute buffers) decoupled from model.TotalSizeMB.
+	// The overhead is computed as: neededMB_from_EstimateVRAMNeed - TotalSizeMB - kvTotalMB
+	// and then applied as: nonExpertMB + gpuExpertLayers*expertPerLayerMB + overheadMB
+
+	flags := map[string]string{
+		"--n-cpu-moe": "32",
+		"--ctx-size":  "65536",
+	}
+
+	// Compute kvTotalMB the same way PredictVRAMUsage does
+	kvTotalMB := computeKVTotalMB(model, 65536, "f16")
+
+	// Compute expected overhead: this is what EstimateVRAMNeed contributes
+	// beyond the model weights and KV cache (i.e., CUDA context + compute buffers)
+	estimatedNeeded, _ := EstimateVRAMNeed(model, 65536, 512, kvTotalMB, caps, "")
+	overheadMB := estimatedNeeded - model.TotalSizeMB - kvTotalMB
+	if overheadMB < 0 {
+		overheadMB = 0
+	}
+
+	// Compute expected MoE result using the decoupled overhead
+	nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
+	expertPerLayerMB := bytesToMiBCeil(model.ExpertBytes / int64(model.NumLayers))
+	gpuExpertLayers := model.NumLayers - 32
+	if gpuExpertLayers < 0 {
+		gpuExpertLayers = 0
+	}
+	expectedNeeded := nonExpertMB + gpuExpertLayers*expertPerLayerMB + overheadMB
+
+	needed, _ := PredictVRAMUsage(model, flags, caps)
+
+	if needed != expectedNeeded {
+		t.Errorf("MoE overhead not correctly decoupled from TotalSizeMB.\n"+
+			"  needed=%d, expected=%d\n"+
+			"  nonExpertMB=%d + gpuLayers(%d)*expertPerLayer(%d) + overhead(%d)\n"+
+			"  (overhead = estimatedNeeded(%d) - TotalSizeMB(%d) - kvTotalMB(%d))",
+			needed, expectedNeeded,
+			nonExpertMB, gpuExpertLayers, expertPerLayerMB, overheadMB,
+			estimatedNeeded, model.TotalSizeMB, kvTotalMB)
+	}
+}
+
 func TestParseFlagsToMap(t *testing.T) {
 	args := []string{
 		"llama-server", "-m", "model.gguf",

@@ -7,11 +7,25 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rrifftt/ggrun/pkg/detect"
 
 )
+
+var probeCacheMem = struct {
+	sync.Mutex
+	m map[string]probeCacheEntry
+}{
+	m: make(map[string]probeCacheEntry),
+}
+
+type probeCacheEntry struct {
+	pc    *probeCache
+	sp    *systemProbe
+	mtime time.Time
+}
 
 // GPUAssignment describes layers assigned to a GPU.
 
@@ -138,7 +152,7 @@ func SavePlacementCache(cachePath string, entry *CacheEntry) error {
 	} else {
 		parts = append(parts, "CACHED_MMAP=\"0\"")
 	}
-	return os.WriteFile(cachePath, []byte(strings.Join(parts, "\n")+"\n"), 0644)
+	return atomicWriteFile(cachePath, []byte(strings.Join(parts, "\n")+"\n"), 0644)
 }
 
 func StrategyToCacheEntry(s *Strategy) *CacheEntry {
@@ -156,6 +170,14 @@ func StrategyToCacheEntry(s *Strategy) *CacheEntry {
 		MMap:        s.MMap,
 		KVUnified:   s.KVPlacement == "gpu",
 	}
+}
+
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp := path + fmt.Sprintf(".%d.tmp", os.Getpid())
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 func parseGPUAssignments(s string) []GPUAssignment {
@@ -193,6 +215,18 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 	path := probeCachePath(cacheDir, model, ctxSize, ubatch, kvQuality, kvPlacement, backendTag, gpus, probeParallelKey(parallel))
 	if path == "" {
 		return nil
+	}
+	st, err := os.Stat(path)
+	statOk := err == nil
+	if statOk {
+		probeCacheMem.Lock()
+		if entry, ok := probeCacheMem.m[path]; ok && entry.mtime == st.ModTime() {
+			probeCacheMem.Unlock()
+			if entry.pc != nil {
+				return entry.pc
+			}
+		}
+		probeCacheMem.Unlock()
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -259,6 +293,11 @@ func loadProbeCache(cacheDir string, model *ModelProfile, ctxSize int, ubatch in
 	}
 
 	if pc.ComputeBufMB > 0 || len(pc.ComputeBufByGPU) > 0 || len(pc.RuntimeGraphGrowthByGPU) > 0 || pc.KVPerLayerMB > 0 {
+		if statOk {
+			probeCacheMem.Lock()
+			probeCacheMem.m[path] = probeCacheEntry{pc: pc, mtime: st.ModTime()}
+			probeCacheMem.Unlock()
+		}
 		return pc
 	}
 	return nil
@@ -275,6 +314,18 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 	gpuSig := gpuSignatureHash(gpus)
 	path := filepath.Join(cacheDir, fmt.Sprintf("system_%s.cache", gpuSig))
 
+	st, err := os.Stat(path)
+	statOk := err == nil
+	if statOk {
+		probeCacheMem.Lock()
+		if entry, ok := probeCacheMem.m[path]; ok && entry.mtime == st.ModTime() {
+			probeCacheMem.Unlock()
+			if entry.sp != nil {
+				return entry.sp
+			}
+		}
+		probeCacheMem.Unlock()
+	}
 	data, err := os.ReadFile(path)
 	if err != nil && explicitCacheDir {
 		// App-local installs used to read ~/.cache/ggrun before LLM_APP_HOME
@@ -324,6 +375,11 @@ func loadSystemProbe(cacheDir string, gpus []detect.GPU) *systemProbe {
 	}
 	if sp.CUDAOverheadMB == 0 && len(sp.CUDAOverheadByGPU) == 0 {
 		return nil
+	}
+	if statOk {
+		probeCacheMem.Lock()
+		probeCacheMem.m[path] = probeCacheEntry{sp: sp, mtime: st.ModTime()}
+		probeCacheMem.Unlock()
 	}
 	return sp
 }

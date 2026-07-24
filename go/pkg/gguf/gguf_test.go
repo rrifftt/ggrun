@@ -160,6 +160,97 @@ func TestParse_MoEDetection(t *testing.T) {
 	}
 }
 
+func TestInfoSubStructsPopulated(t *testing.T) {
+	metadata := map[string]interface{}{
+		"general.architecture":   "qwen2moe",
+		"qwen2moe.block_count":   uint32(60),
+		"qwen2moe.expert_count":  uint32(64),
+		"qwen2moe.expert_used_count": uint32(4),
+		"qwen2moe.expert_shared_count": uint32(2),
+		"qwen2moe.expert_feed_forward_length": uint32(2048),
+		"qwen2moe.fused_experts":  uint32(1),
+		"qwen2moe.attention.head_count_kv": uint32(8),
+		"qwen2moe.attention.key_length":   uint32(128),
+		"qwen2moe.attention.value_length": uint32(128),
+		"qwen2moe.attention.sliding_window": uint32(1024),
+		"qwen2moe.attention.kv_lora_rank": uint32(64),
+		"qwen2moe.attention.q_lora_rank":  uint32(64),
+		"qwen2moe.attention.key_length_mla": uint32(256),
+		"qwen2moe.attention.value_length_mla": uint32(256),
+		"qwen2moe.ssm.state_size": uint32(16),
+		"qwen2moe.ssm.full_attention_interval": uint32(4),
+	}
+	data := buildMinimalGGUF(metadata, nil)
+	path := writeTempGGUF(t, data)
+
+	info, err := Parse(path)
+	if err != nil {
+		t.Fatalf("Parse failed: %v", err)
+	}
+
+	// MoE sub-struct matches flat field
+	if info.MoE.Experts != 64 {
+		t.Errorf("expected MoE.Experts=64, got %d", info.MoE.Experts)
+	}
+	if info.Experts != 64 {
+		t.Errorf("expected Experts=64 (flat), got %d", info.Experts)
+	}
+	if info.MoE.ExpertUsed != 4 {
+		t.Errorf("expected MoE.ExpertUsed=4, got %d", info.MoE.ExpertUsed)
+	}
+	if info.MoE.ExpSharedFF != 2 {
+		t.Errorf("expected MoE.ExpSharedFF=2, got %d", info.MoE.ExpSharedFF)
+	}
+	if !info.MoE.HasShexp {
+		t.Errorf("expected MoE.HasShexp=true")
+	}
+	if info.MoE.ExpFF != 2048 {
+		t.Errorf("expected MoE.ExpFF=2048, got %d", info.MoE.ExpFF)
+	}
+	if info.MoE.Fused != 1 {
+		t.Errorf("expected MoE.Fused=1, got %d", info.MoE.Fused)
+	}
+
+	// Attention sub-struct matches flat field
+	if info.Attention.HeadCountKV != 8 {
+		t.Errorf("expected Attention.HeadCountKV=8, got %d", info.Attention.HeadCountKV)
+	}
+	if info.HeadCountKV != 8 {
+		t.Errorf("expected HeadCountKV=8 (flat), got %d", info.HeadCountKV)
+	}
+	if info.Attention.KeyLength != 128 {
+		t.Errorf("expected Attention.KeyLength=128, got %d", info.Attention.KeyLength)
+	}
+	if info.Attention.ValueLength != 128 {
+		t.Errorf("expected Attention.ValueLength=128, got %d", info.Attention.ValueLength)
+	}
+	if info.Attention.SlidingWindow != 1024 {
+		t.Errorf("expected Attention.SlidingWindow=1024, got %d", info.Attention.SlidingWindow)
+	}
+
+	// MLA sub-struct
+	if info.MLA.KVLoraRank != 64 {
+		t.Errorf("expected MLA.KVLoraRank=64, got %d", info.MLA.KVLoraRank)
+	}
+	if info.MLA.QLoraRank != 64 {
+		t.Errorf("expected MLA.QLoraRank=64, got %d", info.MLA.QLoraRank)
+	}
+	if info.MLA.KeyLengthMLA != 256 {
+		t.Errorf("expected MLA.KeyLengthMLA=256, got %d", info.MLA.KeyLengthMLA)
+	}
+	if info.MLA.ValueLengthMLA != 256 {
+		t.Errorf("expected MLA.ValueLengthMLA=256, got %d", info.MLA.ValueLengthMLA)
+	}
+
+	// SSM sub-struct
+	if info.SSMInfo.SSM != 16 {
+		t.Errorf("expected SSMInfo.SSM=16, got %d", info.SSMInfo.SSM)
+	}
+	if info.SSMInfo.FullAttnInterval != 4 {
+		t.Errorf("expected SSMInfo.FullAttnInterval=4, got %d", info.SSMInfo.FullAttnInterval)
+	}
+}
+
 func TestParse_EmptyPath(t *testing.T) {
 	_, err := Parse("")
 	if err == nil {

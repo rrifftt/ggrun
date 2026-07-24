@@ -42,7 +42,14 @@ func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect
     }
     
     neededMB, _ = EstimateVRAMNeed(model, ctxSize, ubatch, kvTotalMB, caps, "")
-    
+
+    // overheadMB is the CUDA/compute overhead from EstimateVRAMNeed.
+    // Decouple from model.TotalSizeMB so future changes don't silently corrupt this calc.
+    overheadMB := neededMB - model.TotalSizeMB - kvTotalMB
+    if overheadMB < 0 {
+        overheadMB = 0
+    }
+
     if model.IsMoE && ncpuMoe > 0 && model.ExpertBytes > 0 && model.NumLayers > 0 {
         nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
         if nonExpertMB <= 0 {
@@ -53,7 +60,7 @@ func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect
         if gpuExpertLayers < 0 {
             gpuExpertLayers = 0
         }
-        neededMB = nonExpertMB + gpuExpertLayers*expertPerLayerMB + (neededMB - model.TotalSizeMB)
+        neededMB = nonExpertMB + gpuExpertLayers*expertPerLayerMB + overheadMB
     }
     return neededMB, freeMB
 }
@@ -196,7 +203,7 @@ func measuredCUDAOverheadMB(sysProbe *systemProbe) int {
 func firstLaunchComputeBufMBParallel(model *ModelProfile, uBatch, parallel int) int {
 	est := uBatch * 4
 	if model != nil && model.HiddenSize > 0 && model.NumLayers > 0 {
-		coefficient := 42.0
+		coefficient := computeCoefficientGeneric
 		// DeepSeek4's routed MLA graph is substantially larger than a generic
 		// MoE graph. Do not project that architecture-specific coefficient onto
 		// Kimi/Mixtral/etc.; their exact backend preflight will calibrate them.

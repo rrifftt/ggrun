@@ -428,7 +428,7 @@ func TestSelectBackendBackendFlagOverridesConfiguredServerBin(t *testing.T) {
 	}
 
 	caps := &detect.Capabilities{Backends: []detect.Backend{
-		{Name: "llama-server", Path: vulkanPath},
+		{Tag: "llama-server", Path: vulkanPath},
 	}}
 	req := &launchRequest{
 		ServerBin:       ikPath,
@@ -456,7 +456,7 @@ func TestSelectBackendExplicitServerBinWins(t *testing.T) {
 	}
 
 	caps := &detect.Capabilities{Backends: []detect.Backend{
-		{Name: "llama-server", Path: vulkanPath},
+		{Tag: "llama-server", Path: vulkanPath},
 	}}
 	req := &launchRequest{
 		ServerBin:         ikPath,

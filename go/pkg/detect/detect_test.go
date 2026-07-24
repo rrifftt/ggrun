@@ -1,8 +1,28 @@
 package detect
 
 import (
+	"context"
 	"testing"
+	"time"
 )
+
+func TestParseCSVLine(t *testing.T) {
+	withSpaces := parseCSVLine("0, 00000000:01:00.0, RTX 4070, 12288, 512, 545.23, 8.9")
+	withoutSpaces := parseCSVLine("0,00000000:01:00.0,RTX 4070,12288,512,545.23,8.9")
+
+	if len(withSpaces) != 7 {
+		t.Fatalf("expected 7 fields, got %d: %v", len(withSpaces), withSpaces)
+	}
+	if len(withoutSpaces) != 7 {
+		t.Fatalf("expected 7 fields, got %d: %v", len(withoutSpaces), withoutSpaces)
+	}
+
+	for i := 0; i < 7; i++ {
+		if withSpaces[i] != withoutSpaces[i] {
+			t.Fatalf("field %d mismatch: %q vs %q", i, withSpaces[i], withoutSpaces[i])
+		}
+	}
+}
 
 func TestDetect(t *testing.T) {
 	caps, err := Detect()
@@ -82,7 +102,7 @@ func TestNVIDIAPCIeLinkUsesObservedWidthWithMaxGen(t *testing.T) {
 	}
 	gpu := GPU{}
 	applyNVIDIAPCIeLink(&gpu, links[0])
-	if gpu.PCIGen != 3 || gpu.PCILanes != 1 || gpu.BandwidthMBps != pcieBandwidth(3, 1) || gpu.BandwidthSource != "observed_width" {
+	if gpu.PCIGen != 3 || gpu.PCILanes != 1 || gpu.BandwidthMBps != pcieBandwidth(3, 1) || gpu.BandwidthSource != BandwidthSourceObservedWidth {
 		t.Fatalf("unexpected observed-width link: %+v", gpu)
 	}
 }
@@ -94,7 +114,7 @@ func TestNVIDIAPCIeLinkKeepsMaxWhenWidthMatches(t *testing.T) {
 	}
 	gpu := GPU{}
 	applyNVIDIAPCIeLink(&gpu, links[0])
-	if gpu.PCIGen != 3 || gpu.PCILanes != 16 || gpu.BandwidthMBps != pcieBandwidth(3, 16) || gpu.BandwidthSource != "max" {
+	if gpu.PCIGen != 3 || gpu.PCILanes != 16 || gpu.BandwidthMBps != pcieBandwidth(3, 16) || gpu.BandwidthSource != BandwidthSourceMax {
 		t.Fatalf("unexpected max link: %+v", gpu)
 	}
 }
@@ -290,4 +310,34 @@ func TestApplySettleRoundDetectsInstability(t *testing.T) {
 	if gpus[0].VRAMUsedMB != 500 {
 		t.Fatalf("expected the GPU reading to still be updated to the latest sample, got %d", gpus[0].VRAMUsedMB)
 	}
+}
+
+func TestSettleGPUFreeVRAMRespectsContextCancel(t *testing.T) {
+	// Already-cancelled context should return immediately, not sleep 400ms.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	gpus := []GPU{{Index: 0, PCIBusID: "0000:01:00.0", VRAMUsedMB: 9000}}
+	start := time.Now()
+	settleGPUFreeVRAM(ctx, gpus)
+	elapsed := time.Since(start)
+
+	if elapsed >= 50*time.Millisecond {
+		t.Fatalf("expected settleGPUFreeVRAM to return instantly on cancelled context, took %v", elapsed)
+	}
+}
+
+func FuzzParseNVIDIAMemoryUsedMB(f *testing.F) {
+	f.Add([]byte("00000000:01:00.0, 20114\n"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_ = parseNVIDIAMemoryUsedMB(string(data))
+	})
+}
+
+func FuzzVulkanHeapSizeBytes(f *testing.F) {
+	f.Add([]byte("size = 12878610432 (0x2ff800000) (11.99 GiB)"))
+	f.Add([]byte("size = 0"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		_, _ = vulkanHeapSizeBytes(string(data))
+	})
 }

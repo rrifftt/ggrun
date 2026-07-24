@@ -52,6 +52,16 @@ func (ft FailureType) deterministic() bool {
 	return ft == FailureBackendCapability || ft == FailureUnknownModel
 }
 
+// Hooks groups the optional callbacks for Launcher.Run.
+type Hooks struct {
+	OnLog       func(string)
+	OnFailure   func(FailureType, string)
+	OnRestart   func(int, time.Duration)
+	OnFallback  func(string)
+	OnCUDAOOM   func(device int, allocMB int, args []string) ([]string, *placement.CacheEntry, bool)
+	OnPromote   func(logPath string, args []string) ([]string, bool)
+}
+
 // Launcher wraps server startup with crash recovery and fallback.
 type Launcher struct {
 	BinaryPath    string
@@ -61,12 +71,7 @@ type Launcher struct {
 	BackoffBase   time.Duration
 	HealthTimeout time.Duration
 	KeepAlive     bool
-	OnLog         func(string)
-	OnFailure     func(FailureType, string)
-	OnRestart     func(int, time.Duration)
-	OnFallback    func(string)
-	OnCUDAOOM     func(device int, allocMB int, args []string) ([]string, *placement.CacheEntry, bool)
-	OnPromote     func(logPath string, args []string) ([]string, bool)
+	Hooks         Hooks
 
 	// Quiet keeps the backend's stdout out of the terminal (it still goes to the
 	// per-run log file). Used when ggrun hands the terminal to a foreground
@@ -82,17 +87,25 @@ type Launcher struct {
 	// PlacementCachePath the first time the server loads healthy — so a launch
 	// that lands right is reused verbatim next time (OOM-recovery overwrites it
 	// with the corrected placement if it has to intervene).
-	SuccessEntry     *placement.CacheEntry
-	ProbeCacheDir    string
-	ProbeModel       *placement.ModelProfile
-	ProbeCtxSize     int
-	ProbeUBatchSize  int
-	ProbeKVQuality   string
-	ProbeKVPlacement string
-	ProbeBackendTag  string
-	ProbeGPUs        []detect.GPU
+	SuccessEntry *placement.CacheEntry
+	// Probe holds parameters for writing the post-launch probe cache.
+	// ponytail: grouped from 8 Probe* fields into a single struct.
+	Probe *ProbeConfig
 
+	lastLogMu   sync.Mutex
 	lastLogPath string // log written by the most recent runOnce
+}
+
+// ProbeConfig holds the parameters needed to write the post-launch probe cache.
+type ProbeConfig struct {
+	CacheDir     string
+	Model        *placement.ModelProfile
+	CtxSize      int
+	UBatchSize   int
+	KVQuality    string
+	KVPlacement  string
+	BackendTag   string
+	GPUs         []detect.GPU
 }
 
 // DefaultLauncher returns a launcher with sensible defaults.
@@ -123,6 +136,8 @@ func (l *Launcher) Run(ctx context.Context) error {
 				promotionRestarts++
 				restartCount = 0
 				backoff = l.BackoffBase
+				// A promoted relaunch is a fresh launch attempt; reset the OOM retry budget.
+				cudaOOMRetries = 0
 				continue
 			}
 
@@ -134,14 +149,14 @@ func (l *Launcher) Run(ctx context.Context) error {
 
 			// Check for known failure types from stderr log
 			ft, msg := l.parseLoadFailure()
-			if l.OnFailure != nil {
-				l.OnFailure(ft, msg)
+			if l.Hooks.OnFailure != nil {
+				l.Hooks.OnFailure(ft, msg)
 			}
 
-			if ft == FailureCUDAOOM && cudaOOMRetries < 2 && l.OnCUDAOOM != nil {
+			if ft == FailureCUDAOOM && cudaOOMRetries < 2 && l.Hooks.OnCUDAOOM != nil {
 				device, allocMB, ok := ParseCUDAOOM(msg)
 				if ok {
-					if newArgs, entry, retry := l.OnCUDAOOM(device, allocMB, append([]string(nil), l.Args...)); retry {
+					if newArgs, entry, retry := l.Hooks.OnCUDAOOM(device, allocMB, append([]string(nil), l.Args...)); retry {
 						l.Args = newArgs
 						// Don't persist the derated placement yet — it has never
 						// loaded. Make it the success candidate; handleHealthy
@@ -158,8 +173,8 @@ func (l *Launcher) Run(ctx context.Context) error {
 
 			// Try ik_llama -> mainline fallback for unknown model
 			if ft == FailureUnknownModel && l.FallbackPath != "" && binaryPath == l.BinaryPath {
-				if l.OnFallback != nil {
-					l.OnFallback(l.FallbackPath)
+				if l.Hooks.OnFallback != nil {
+					l.Hooks.OnFallback(l.FallbackPath)
 				}
 				binaryPath = l.FallbackPath
 				restartCount = 0
@@ -185,8 +200,8 @@ func (l *Launcher) Run(ctx context.Context) error {
 
 			// Backoff and restart
 			restartCount++
-			if l.OnRestart != nil {
-				l.OnRestart(restartCount, backoff)
+			if l.Hooks.OnRestart != nil {
+				l.Hooks.OnRestart(restartCount, backoff)
 			}
 			select {
 			case <-ctx.Done():
@@ -220,7 +235,9 @@ func (l *Launcher) runOnce(ctx context.Context, binaryPath string, restartCount 
 	logPath := logFile.Name()
 	// Remember our own log so failure parsing never reads a log written by a
 	// concurrently running instance.
+	l.lastLogMu.Lock()
 	l.lastLogPath = logPath
+	l.lastLogMu.Unlock()
 
 	cmd := exec.CommandContext(ctx, binaryPath, l.Args...)
 	cmd.SysProcAttr = setProcessGroupAttr()
@@ -360,10 +377,10 @@ func (l *Launcher) handleHealthy(logPath string) bool {
 	if l.PlacementCachePath != "" && l.SuccessEntry != nil {
 		_ = placement.SavePlacementCache(l.PlacementCachePath, l.SuccessEntry)
 	}
-	if l.OnPromote == nil {
+	if l.Hooks.OnPromote == nil {
 		return false
 	}
-	newArgs, ok := l.OnPromote(logPath, append([]string(nil), l.Args...))
+	newArgs, ok := l.Hooks.OnPromote(logPath, append([]string(nil), l.Args...))
 	if !ok || len(newArgs) == 0 {
 		return false
 	}
@@ -793,10 +810,14 @@ func ParseCUDADevice(line string) (device int, ok bool) {
 
 // parseLoadFailure reads this launcher's own log for known error patterns.
 func (l *Launcher) parseLoadFailure() (FailureType, string) {
-	if l.lastLogPath == "" {
+	l.lastLogMu.Lock()
+	path := l.lastLogPath
+	l.lastLogMu.Unlock()
+
+	if path == "" {
 		return FailureUnknown, ""
 	}
-	f, err := os.Open(l.lastLogPath)
+	f, err := os.Open(path)
 	if err != nil {
 		return FailureUnknown, ""
 	}
@@ -874,9 +895,11 @@ func (l *Launcher) writeProbeCache(logPath string) {
 	if computeBuf <= 0 && kvPerLayer <= 0 {
 		return
 	}
-	if l.ProbeModel != nil {
-		computeByGPU := placement.ParseComputeBuffersByGPU(string(data))
-		_ = placement.WriteProbeCacheForModel(l.ProbeCacheDir, l.ProbeModel, l.ProbeCtxSize, l.ProbeUBatchSize, l.ProbeKVQuality, l.ProbeKVPlacement, l.ProbeBackendTag, l.ProbeGPUs, computeByGPU, kvPerLayer)
+	if l.Probe != nil {
+		if l.Probe.Model != nil {
+			computeByGPU := placement.ParseComputeBuffersByGPU(string(data))
+			_ = placement.WriteProbeCacheForModel(l.Probe.CacheDir, l.Probe.Model, l.Probe.CtxSize, l.Probe.UBatchSize, l.Probe.KVQuality, l.Probe.KVPlacement, l.Probe.BackendTag, l.Probe.GPUs, computeByGPU, kvPerLayer)
+		}
 		return
 	}
 	modelName := l.extractModelName()

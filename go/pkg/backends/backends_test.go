@@ -1,6 +1,9 @@
 package backends
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestHY3RecipeIsPinnedAndRouted(t *testing.T) {
 	recipe := RecipeByName("hy3")
@@ -22,5 +25,24 @@ func TestHY3RecipeIsPinnedAndRouted(t *testing.T) {
 	again := RecipeByName("HY3")
 	if again == nil || again.Commit == "changed" {
 		t.Fatal("recipe lookup leaked mutable catalog state")
+	}
+}
+
+func TestUpsertConcurrentSafe(t *testing.T) {
+	n := 20
+	for i := 0; i < n; i++ {
+		tag := fmt.Sprintf("g%d", i)
+		if err := Upsert(Backend{Tag: tag, Path: "/dev/null"}); err != nil {
+			t.Fatalf("goroutine %d Upsert failed: %v", i, err)
+		}
+	}
+
+	list := Load()
+	seen := make(map[string]bool)
+	for _, b := range list {
+		seen[b.Tag] = true
+	}
+	if len(seen) != n {
+		t.Fatalf("expected %d distinct tags, got %d: %v", n, len(seen), seen)
 	}
 }

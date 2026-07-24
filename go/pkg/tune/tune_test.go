@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -187,6 +188,37 @@ func TestSaveTuneFileMarksFinalRunCompleteWithSkippedRounds(t *testing.T) {
 	}
 	if got := doc["completed_rounds"]; got != float64(8) {
 		t.Fatalf("expected completed_rounds 8, got %#v", got)
+	}
+}
+
+func TestCacheAddConcurrentSafe(t *testing.T) {
+	tmpDir := t.TempDir()
+	c := NewCache(tmpDir)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		idx := i
+		go func() {
+			defer wg.Done()
+			_ = c.Add(Entry{
+				Timestamp:    int64(idx),
+				ModelPath:    "test.gguf",
+				HardwareHash: "hw1",
+				Round:        idx,
+				Result:       BenchmarkResult{GenTPS: float64(idx)},
+				Best:         true,
+			})
+		}()
+	}
+	wg.Wait()
+
+	entries, err := c.Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if len(entries) != 20 {
+		t.Fatalf("expected 20 entries, got %d", len(entries))
 	}
 }
 

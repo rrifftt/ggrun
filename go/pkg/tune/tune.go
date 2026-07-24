@@ -8,11 +8,15 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Entry holds one tuning attempt result.
 const TuneSchemaVersion = 2
+
+// cacheMu protects Cache operations from concurrent in-process access.
+var cacheMu sync.Mutex
 
 type Entry struct {
 	Timestamp     int64                  `json:"timestamp"`
@@ -73,8 +77,8 @@ func (c *Cache) Load() ([]Entry, error) {
 	return entries, nil
 }
 
-// Save writes entries to disk.
-func (c *Cache) Save(entries []Entry) error {
+// writeEntries writes entries to disk. Caller must hold cacheMu and the file lock.
+func (c *Cache) writeEntries(entries []Entry) error {
 	if err := os.MkdirAll(filepath.Dir(c.path), 0755); err != nil {
 		return err
 	}
@@ -83,6 +87,20 @@ func (c *Cache) Save(entries []Entry) error {
 		return err
 	}
 	return os.WriteFile(c.path, data, 0644)
+}
+
+// Save writes entries to disk.
+func (c *Cache) Save(entries []Entry) error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	_, release, err := AcquireLock(c.path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return c.writeEntries(entries)
 }
 
 // FindBest returns the best entry for given model + hardware hash.
@@ -105,6 +123,15 @@ func (c *Cache) FindBest(modelPath, hwHash string) (*Entry, error) {
 
 // Add appends a new entry and marks previous best as non-best if this is better.
 func (c *Cache) Add(entry Entry) error {
+	cacheMu.Lock()
+	defer cacheMu.Unlock()
+
+	_, release, err := AcquireLock(c.path + ".lock")
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	entries, err := c.Load()
 	if err != nil {
 		return err
@@ -124,7 +151,7 @@ func (c *Cache) Add(entry Entry) error {
 	}
 
 	entries = append(entries, entry)
-	return c.Save(entries)
+	return c.writeEntries(entries)
 }
 
 func sameTuneScope(a, b Entry) bool {

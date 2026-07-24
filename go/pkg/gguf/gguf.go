@@ -64,6 +64,28 @@ const (
 // Public types
 // ============================================================================
 
+// MoEInfo holds Mixture-of-Experts metadata.
+type MoEInfo struct {
+    Experts, ExpertUsed, ExpFF, ExpSharedFF, Fused int
+    HasShexp                                      bool
+    ExpertBytes, NonExpertBytes, ShexpBytes       int64
+}
+
+// SSMInfo holds State-Space-Model metadata.
+type SSMInfo struct {
+    SSM, FullAttnInterval int
+}
+
+// MLAInfo holds Multi-Latent-Attention metadata.
+type MLAInfo struct {
+    KVLoraRank, QLoraRank, KeyLengthMLA, ValueLengthMLA int
+}
+
+// AttentionInfo holds attention-head metadata.
+type AttentionInfo struct {
+    HeadCountKV, KeyLength, ValueLength, SlidingWindow int
+}
+
 // Info holds parsed GGUF metadata.
 //
 // Numeric fields are zero when the corresponding metadata key is absent or
@@ -78,35 +100,40 @@ type Info struct {
 	ContextLength      int    `json:"ctx_train"`
 	EmbeddingLength    int    `json:"embd"`
 	FeedForwardLength  int    `json:"ff"`
-	HeadCountKV        int    `json:"hkv"`
-	KeyLength          int    `json:"kl"`
-	ValueLength        int    `json:"vl"`
+	HeadCountKV        int    `json:"hkv"` // Deprecated: use Info.Attention.HeadCountKV
+	KeyLength          int    `json:"kl"` // Deprecated: use Info.Attention.KeyLength
+	ValueLength        int    `json:"vl"` // Deprecated: use Info.Attention.ValueLength
 	VocabSize          int    `json:"vocab_size"`
 	TokenizerModel     string `json:"tokenizer_model"`
 	TokenizerPre       string `json:"tokenizer_pre"`
 	TokenizerHash      string `json:"tokenizer_hash"`
-	ExpertBytes        int64  `json:"expert_bytes"`
-	NonExpertBytes     int64  `json:"non_expert_bytes"`
+	ExpertBytes        int64  `json:"expert_bytes"` // Deprecated: use Info.MoE.ExpertBytes
+	NonExpertBytes     int64  `json:"non_expert_bytes"` // Deprecated: use Info.MoE.NonExpertBytes
 	TokenEmbdBytes     int64  `json:"token_embd_bytes"`
 	OutputBytes        int64  `json:"output_bytes"`
-	ShexpBytes         int64  `json:"shexp_bytes"`
-	Fused              int    `json:"fused"`
-	Experts            int    `json:"experts"`
-	ExpertUsed         int    `json:"exp_used"`
-	ExpFF              int    `json:"exp_ff"`
-	ExpSharedFF        int    `json:"exp_shared_ff"`
+	ShexpBytes         int64  `json:"shexp_bytes"` // Deprecated: use Info.MoE.ShexpBytes
+	Fused              int    `json:"fused"` // Deprecated: use Info.MoE.Fused
+	Experts            int    `json:"experts"` // Deprecated: use Info.MoE.Experts
+	ExpertUsed         int    `json:"exp_used"` // Deprecated: use Info.MoE.ExpertUsed
+	ExpFF              int    `json:"exp_ff"` // Deprecated: use Info.MoE.ExpFF
+	ExpSharedFF        int    `json:"exp_shared_ff"` // Deprecated: use Info.MoE.ExpSharedFF
 	NRot               int    `json:"n_rot"`
-	SSM                int    `json:"ssm"`
-	FullAttnInterval   int    `json:"full_interval"`
-	SlidingWindow      int    `json:"swa"`
+	SSM                int    `json:"ssm"` // Deprecated: use Info.SSM.SSM
+	FullAttnInterval   int    `json:"full_interval"` // Deprecated: use Info.SSM.FullAttnInterval
+	SlidingWindow      int    `json:"swa"` // Deprecated: use Info.Attention.SlidingWindow
 	LeadingDense       int    `json:"leading_dense"`
-	KVLoraRank         int    `json:"kv_lora"`
-	QLoraRank          int    `json:"q_lora"`
-	KeyLengthMLA       int    `json:"kl_mla"`
-	ValueLengthMLA     int    `json:"vl_mla"`
-	HasShexp           bool   `json:"has_shexp"`
+	KVLoraRank         int    `json:"kv_lora"` // Deprecated: use Info.MLA.KVLoraRank
+	QLoraRank          int    `json:"q_lora"` // Deprecated: use Info.MLA.QLoraRank
+	KeyLengthMLA       int    `json:"kl_mla"` // Deprecated: use Info.MLA.KeyLengthMLA
+	ValueLengthMLA     int    `json:"vl_mla"` // Deprecated: use Info.MLA.ValueLengthMLA
+	HasShexp           bool   `json:"has_shexp"` // Deprecated: use Info.MoE.HasShexp
 	NextNPredictLayers int    `json:"nextn_predict_layers"`
 	IsMoE              bool   `json:"is_moe"`
+
+	MoE        MoEInfo
+	SSMInfo    SSMInfo
+	MLA        MLAInfo
+	Attention  AttentionInfo
 
 	// Unexported: tensor headers observed during parse. Used by EstimateParams
 	// to derive an architecture-agnostic parameter count from tensor dims.
@@ -846,34 +873,42 @@ func applyArchMeta(suffix string, val ggufScalar, info *Info) {
 	case "attention.head_count_kv":
 		if v, ok := val.asUint(); ok {
 			info.HeadCountKV = int(v)
+			info.Attention.HeadCountKV = int(v)
 		}
 	case "attention.key_length":
 		if v, ok := val.asUint(); ok {
 			info.KeyLength = int(v)
+			info.Attention.KeyLength = int(v)
 		}
 	case "attention.value_length":
 		if v, ok := val.asUint(); ok {
 			info.ValueLength = int(v)
+			info.Attention.ValueLength = int(v)
 		}
 	case "attention.sliding_window":
 		if v, ok := val.asUint(); ok {
 			info.SlidingWindow = int(v)
+			info.Attention.SlidingWindow = int(v)
 		}
 	case "attention.kv_lora_rank":
 		if v, ok := val.asUint(); ok {
 			info.KVLoraRank = int(v)
+			info.MLA.KVLoraRank = int(v)
 		}
 	case "attention.q_lora_rank":
 		if v, ok := val.asUint(); ok {
 			info.QLoraRank = int(v)
+			info.MLA.QLoraRank = int(v)
 		}
 	case "attention.key_length_mla":
 		if v, ok := val.asUint(); ok {
 			info.KeyLengthMLA = int(v)
+			info.MLA.KeyLengthMLA = int(v)
 		}
 	case "attention.value_length_mla":
 		if v, ok := val.asUint(); ok {
 			info.ValueLengthMLA = int(v)
+			info.MLA.ValueLengthMLA = int(v)
 		}
 
 	// RoPE
@@ -886,25 +921,31 @@ func applyArchMeta(suffix string, val ggufScalar, info *Info) {
 	case "expert_count":
 		if v, ok := val.asUint(); ok {
 			info.Experts = int(v)
+			info.MoE.Experts = int(v)
 		}
 	case "expert_used_count":
 		if v, ok := val.asUint(); ok {
 			info.ExpertUsed = int(v)
+			info.MoE.ExpertUsed = int(v)
 		}
 	case "expert_shared_count":
 		if v, ok := val.asUint(); ok {
 			info.ExpSharedFF = int(v)
+			info.MoE.ExpSharedFF = int(v)
 			if v > 0 {
 				info.HasShexp = true
+				info.MoE.HasShexp = true
 			}
 		}
 	case "expert_feed_forward_length":
 		if v, ok := val.asUint(); ok {
 			info.ExpFF = int(v)
+			info.MoE.ExpFF = int(v)
 		}
 	case "fused_experts":
 		if v, ok := val.asUint(); ok {
 			info.Fused = int(v)
+			info.MoE.Fused = int(v)
 		}
 
 	// SSM / hybrid
@@ -913,6 +954,7 @@ func applyArchMeta(suffix string, val ggufScalar, info *Info) {
 		if info.SSM == 0 {
 			if v, ok := val.asUint(); ok {
 				info.SSM = int(v)
+				info.SSMInfo.SSM = int(v)
 			}
 		}
 	case "ssm.full_attention_interval",
@@ -920,6 +962,7 @@ func applyArchMeta(suffix string, val ggufScalar, info *Info) {
 		"attention.full_attention_interval":
 		if v, ok := val.asUint(); ok {
 			info.FullAttnInterval = int(v)
+			info.SSMInfo.FullAttnInterval = int(v)
 		}
 	}
 }

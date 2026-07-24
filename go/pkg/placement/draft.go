@@ -342,7 +342,8 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 	if draftSizeMB <= 0 {
 		draftSizeMB = 1024
 	}
-	cfg.KVTypeDraft = computeDraftKVType(caps, draftInfo)
+	// Provisional KV type for GPU 0 — refined below after findDraftGPU picks the target.
+	cfg.KVTypeDraft = computeDraftKVType(caps, 0)
 	draftKVMB := computeKVTotalMB(&ModelProfile{
 		HeadCountKV:      draftInfo.HeadCountKV,
 		KeyLength:        draftInfo.KeyLength,
@@ -355,7 +356,12 @@ func applyParsedDraftModel(cfg *DraftConfig, target *ModelProfile, caps *detect.
 		FullAttnInterval: draftInfo.FullAttnInterval,
 	}, draftCTX, cfg.KVTypeDraft)
 
-	cfg.DraftGPU = findDraftGPU(caps, target, draftSizeMB+draftKVMB+computeFloorMB)
+	gpu, err := findDraftGPU(caps, target, draftSizeMB+draftKVMB+computeFloorMB)
+	if err != nil {
+		return false
+	}
+	cfg.DraftGPU = gpu
+	cfg.KVTypeDraft = computeDraftKVType(caps, cfg.DraftGPU)
 	if caps.CPU.Cores >= 4 {
 		cfg.ThreadsDraft = 2
 	} else {
@@ -1524,7 +1530,8 @@ func draftQuantRank(name string) int {
 
 // findDraftGPU selects the GPU with the most free VRAM after the target model
 // loads its layers. This ensures the draft model has room without colliding.
-func findDraftGPU(caps *detect.Capabilities, target *ModelProfile, draftVRAMNeed int) int {
+// Returns (-1, error) when no GPU has enough free VRAM.
+func findDraftGPU(caps *detect.Capabilities, target *ModelProfile, draftVRAMNeed int) (int, error) {
 	bestGPU := 0
 	bestFree := 0
 
@@ -1538,7 +1545,10 @@ func findDraftGPU(caps *detect.Capabilities, target *ModelProfile, draftVRAMNeed
 			bestGPU = i
 		}
 	}
-	return bestGPU
+	if bestFree <= 0 {
+		return -1, fmt.Errorf("no GPU has enough free VRAM for draft model")
+	}
+	return bestGPU, nil
 }
 
 // estimateTargetVRAMUse estimates how much VRAM the target model uses on a given GPU.
@@ -1581,20 +1591,14 @@ func estimateTargetVRAMUse(target *ModelProfile, caps *detect.Capabilities, gpuI
 	return int(float64(target.TotalSizeMB) * vramOverheadPercent / 100 * share)
 }
 
-// computeDraftKVType determines the KV cache type for the draft model.
-// Prefers the same type as the target for consistency, falls back to q4_0
-// if the draft model is too large for q8_0 on the selected GPU.
-func computeDraftKVType(caps *detect.Capabilities, draftInfo *gguf.Info) string {
-	if draftInfo == nil || len(caps.GPUs) == 0 {
+// computeDraftKVType determines the KV cache type for the draft model
+// based on the selected GPU's free VRAM.
+func computeDraftKVType(caps *detect.Capabilities, draftGPU int) string {
+	if draftGPU < 0 || draftGPU >= len(caps.GPUs) {
 		return "q4_0"
 	}
-
-	// For draft models (typically < 2GB), q8_0 KV cache is fine
-	// on any GPU with > 4GB free. Use q4_0 on smaller GPUs.
-	for _, g := range caps.GPUs {
-		if g.VRAMTotalMB-g.VRAMUsedMB > 4096 {
-			return "q8_0"
-		}
+	if caps.GPUs[draftGPU].VRAMTotalMB - caps.GPUs[draftGPU].VRAMUsedMB > 4096 {
+		return "q8_0"
 	}
 	return "q4_0"
 }

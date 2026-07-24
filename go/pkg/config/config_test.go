@@ -212,6 +212,61 @@ func TestShowReportsEachSettingSource(t *testing.T) {
 	}
 }
 
+func TestConfigSaveIsAtomic(t *testing.T) {
+	tmpDir := t.TempDir()
+	origHome := os.Getenv("HOME")
+	os.Setenv("HOME", tmpDir)
+	defer os.Setenv("HOME", origHome)
+
+	cfg := &Config{
+		Port:        9090,
+		Ctx:         "4096",
+		ModelDir:    "/test/models",
+		CacheDir:    "/test/cache",
+		Backend:     "llama",
+		KVPlacement: "cpu",
+		KVQuality:   "high",
+		TuneRounds:  3,
+		Vision:      true,
+		Parallel:    2,
+		KeepAlive:   30,
+		Host:        "0.0.0.0",
+		Spec:        "ngram",
+	}
+
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	data, err := os.ReadFile(Path())
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	// Verify the file is not truncated — contains all expected keys
+	for _, want := range []string{"LLM_PORT=9090", "LLM_CTX_SIZE=\"4096\"", "LLM_MODEL_DIR=\"/test/models\"", "LLM_SPEC=\"ngram\""} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("saved config missing %q:\n%s", want, string(data))
+		}
+	}
+
+	// Verify no leftover tmp file
+	for _, f := range listDir(tmpDir) {
+		if strings.HasSuffix(f, ".tmp") {
+			t.Fatalf("leftover tmp file: %s", f)
+		}
+	}
+}
+
+func listDir(dir string) []string {
+	files, _ := os.ReadDir(dir)
+	out := []string{}
+	for _, f := range files {
+		out = append(out, f.Name())
+	}
+	return out
+}
+
 func TestBudgetParserRejectsMalformedValues(t *testing.T) {
 	for _, raw := range []string{"-1G", "twoG", "2.5G"} {
 		if _, err := ParseBudgetMBStrict(raw); err == nil {

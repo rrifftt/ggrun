@@ -39,10 +39,16 @@ type GPUAssignment struct {
 
 // VRAM and compute sizing constants
 const (
-	vramOverheadPercent = 130  // model size * this / 100 = estimated VRAM needed
-	computePerGPUMB     = 512  // legacy; non-MoE single-GPU sizing only
-	computeFloorMB      = 1024 // cited llama.cpp compute floor; CUDA overhead measured separately
-	minCramMB           = 512
+	vramOverheadPercent    = 130  // model size * this / 100 = estimated VRAM needed
+	computePerGPUMB        = 512  // legacy; non-MoE single-GPU sizing only
+	computeFloorMB         = 1024 // cited llama.cpp compute floor; CUDA overhead measured separately
+	minCramMB              = 512
+
+	// Compute sizing constants
+	computeCoefficientGeneric = 42.0
+	cudaOverheadFallbackMB    = 300
+	cramCapMB                 = 16384
+	cacheRAMCapMB             = 4096
 
 	// Hybrid and recurrent prompt restoration needs a context checkpoint because
 	// its state cannot be shifted like an ordinary transformer KV cache. Keep the
@@ -251,7 +257,7 @@ func applyRAMBudget(caps *detect.Capabilities, budgetMB int) *detect.Capabilitie
 	return &capped
 }
 
-// parseKVType splits a combined KV string (e.g. "f16-q8_0") into base, K, and V types.
+// parseKVType splits a combined KV string (e.g. "f16-q8_0") into K and V types.
 // Compute builds a Strategy from hardware capabilities and model profile.
 func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Strategy, error) {
 	var err error
@@ -380,7 +386,10 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			cpuCaps.GPUs = nil
 			ctx, kvStr := computeAutoContextSize(&cpuCaps, model, totalSizeMB, s.KVType, opts)
 			s.ContextSize = ctx
-			s.KVType, s.KVTypeK, s.KVTypeV = parseKVType(kvStr)
+			kT, vT := parseKVType(kvStr)
+			s.KVTypeK = kT
+			s.KVTypeV = vT
+			s.KVType = kvTypeCombined(kT, vT)
 		} else {
 			sysProbe := loadSystemProbe(opts.CacheDir, caps.GPUs)
 			// Per-GPU non-weight VRAM overhead, derived per-component (measured
@@ -394,12 +403,12 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 			}
 			// Single-GPU estimate
 			singleCtx, singleKVStr := computeAutoContextSizeSingleGPU(caps, model, totalSizeMB, s.KVType, opts)
-			singleKVType, _, _ := parseKVType(singleKVStr)
+			singleKVType, _ := parseKVType(singleKVStr)
 			singleKVM := computeKVTotalMB(model, singleCtx, singleKVType)
 			singleFits := (totalSizeMB+perGPUOH+singleKVM) <= bestFree && singleCtx >= 32768
 			// Multi-GPU estimate
 			multiCtx, multiKVStr := computeAutoContextSize(caps, model, totalSizeMB, s.KVType, opts)
-			multiKVType, _, _ := parseKVType(multiKVStr)
+			multiKVType, _ := parseKVType(multiKVStr)
 			multiKVM := computeKVTotalMB(model, multiCtx, multiKVType)
 			multiFree := 0
 			for _, g := range caps.GPUs {
@@ -409,13 +418,22 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 
 			if multiFits && multiCtx > singleCtx {
 				s.ContextSize = multiCtx
-				s.KVType, s.KVTypeK, s.KVTypeV = parseKVType(multiKVStr)
+				kT, vT := parseKVType(multiKVStr)
+				s.KVTypeK = kT
+				s.KVTypeV = vT
+				s.KVType = kvTypeCombined(kT, vT)
 			} else if singleFits {
 				s.ContextSize = singleCtx
-				s.KVType, s.KVTypeK, s.KVTypeV = parseKVType(singleKVStr)
+				kT, vT := parseKVType(singleKVStr)
+				s.KVTypeK = kT
+				s.KVTypeV = vT
+				s.KVType = kvTypeCombined(kT, vT)
 			} else if multiFits {
 				s.ContextSize = multiCtx
-				s.KVType, s.KVTypeK, s.KVTypeV = parseKVType(multiKVStr)
+				kT, vT := parseKVType(multiKVStr)
+				s.KVTypeK = kT
+				s.KVTypeV = vT
+				s.KVType = kvTypeCombined(kT, vT)
 			} else {
 				// The model doesn't fit wholly in VRAM (a big MoE offloading experts
 				// to CPU). Don't collapse to the 32768/q4_0 floor — size the context
@@ -429,7 +447,10 @@ func Compute(caps *detect.Capabilities, model *ModelProfile, opts Options) (*Str
 				s.KVPlacement = placement
 				ctx, kvStr := computeAutoContextSizeKVPlacement(caps, model, totalSizeMB, s.KVType, placement, opts)
 				s.ContextSize = ctx
-				s.KVType, s.KVTypeK, s.KVTypeV = parseKVType(kvStr)
+				kT, vT := parseKVType(kvStr)
+				s.KVTypeK = kT
+				s.KVTypeV = vT
+				s.KVType = kvTypeCombined(kT, vT)
 			}
 		}
 	}

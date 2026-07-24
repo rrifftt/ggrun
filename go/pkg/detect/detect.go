@@ -1,6 +1,8 @@
 package detect
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/rrifftt/ggrun/pkg/backends"
 )
 
 // Capabilities represents the full hardware and environment profile.
@@ -22,6 +26,13 @@ type Capabilities struct {
 	CPU      CPUInfo   `json:"cpu"`
 	Backends []Backend `json:"backends"`
 }
+
+const (
+	BandwidthSourceObservedWidth = "observed_width"
+	BandwidthSourceMax           = "max"
+	BandwidthSourceCurrent       = "current"
+	BandwidthSourceSysfsMax      = "sysfs_max"
+)
 
 // GPU represents a single GPU device.
 type GPU struct {
@@ -52,15 +63,19 @@ type CPUInfo struct {
 	Flags   string `json:"flags,omitempty"`
 }
 
-// Backend represents a discovered inference backend binary.
-type Backend struct {
-	Name    string `json:"name"`
-	Path    string `json:"path"`
-	Version string `json:"version,omitempty"`
-}
+// Backend is an alias for backends.Backend — the single source of truth for
+// backend identity. detectBackends populates only Tag and Path; the rest are
+// zero (for discovered binaries, not registered forks).
+type Backend = backends.Backend
 
 // Detect probes the system and returns capabilities.
 func Detect() (*Capabilities, error) {
+	return DetectCtx(context.Background())
+}
+
+// DetectCtx probes the system and returns capabilities, using ctx for
+// cancellable operations (e.g. the GPU VRAM settle delay).
+func DetectCtx(ctx context.Context) (*Capabilities, error) {
 	gpus := detectNVIDIA()
 	if len(gpus) == 0 {
 		gpus = detectVulkanGPUs()
@@ -68,7 +83,7 @@ func Detect() (*Capabilities, error) {
 	if len(gpus) == 0 {
 		gpus = detectAppleSilicon()
 	}
-	settleGPUFreeVRAM(gpus)
+	settleGPUFreeVRAM(ctx, gpus)
 
 	ram := detectRAM()
 	cpu := detectCPU()
@@ -86,7 +101,7 @@ func Detect() (*Capabilities, error) {
 
 func detectNVIDIA() []GPU {
 	out, err := exec.Command("nvidia-smi",
-		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,driver_version,compute_cap",
+		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,driver_version,compute_cap,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
 		if !errors.Is(err, exec.ErrNotFound) {
@@ -94,22 +109,11 @@ func detectNVIDIA() []GPU {
 		}
 		return nil
 	}
-	// Query PCIe bandwidth separately. Link speed often idles down to Gen1 when
-	// the GPU is not busy, so current gen is not a stable performance signal.
-	// Lane width is different: on mixed-slot/riser systems a GPU can be physically
-	// limited to x1/x4 even though the card's advertised max width is x16. Use
-	// max gen with observed current width when current width is lower than max;
-	// otherwise keep max gen/width. Non-NVIDIA and unknown platforms leave
-	// bandwidth empty, and placement falls back to neutral free-VRAM weighting.
-	pcieOut, _ := exec.Command("nvidia-smi",
-		"--query-gpu=pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max",
-		"--format=csv,noheader,nounits").Output()
-	pcieLinks := parseNVIDIAPCIeLinks(string(pcieOut))
 
 	var gpus []GPU
-	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		parts := strings.Split(line, ", ")
-		if len(parts) < 6 {
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		parts := parseCSVLine(line)
+		if len(parts) < 7 {
 			continue
 		}
 		idx, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
@@ -133,15 +137,21 @@ func detectNVIDIA() []GPU {
 			PCIBusID:    pciBusID,
 			ComputeCap:  computeCap,
 		}
-		// Parse PCIe bandwidth.
-		if i < len(pcieLinks) {
-			applyNVIDIAPCIeLink(&gpu, pcieLinks[i])
+		// Parse PCIe bandwidth from fields 7-10.
+		if len(parts) >= 11 {
+			link := nvidiaPCIeLink{
+				currentGen:   parsePositiveInt(parts[7]),
+				currentWidth: parsePositiveInt(parts[8]),
+				maxGen:       parsePositiveInt(parts[9]),
+				maxWidth:     parsePositiveInt(parts[10]),
+			}
+			applyNVIDIAPCIeLink(&gpu, link)
 		}
 		// Fallback: if nvidia-smi returned no usable PCIe data, try sysfs.
 		if gpu.BandwidthMBps <= 0 && gpu.PCIBusID != "" {
 			gpu.BandwidthMBps = pcieBandwidthFromSysfs(gpu.PCIBusID)
 			if gpu.BandwidthMBps > 0 {
-				gpu.BandwidthSource = "sysfs_max"
+				gpu.BandwidthSource = BandwidthSourceSysfsMax
 			}
 		}
 		gpus = append(gpus, gpu)
@@ -169,7 +179,7 @@ func detectNVIDIA() []GPU {
 // (already near zero) skip the check entirely — the race only matters when
 // there's real reported usage that might actually be stale. Bounded to a few
 // hundred ms in the common (already-stable) case, up to ~1.6s worst case.
-func settleGPUFreeVRAM(gpus []GPU) {
+func settleGPUFreeVRAM(ctx context.Context, gpus []GPU) {
 	if !anyMeaningfulUsage(gpus) {
 		return
 	}
@@ -177,7 +187,11 @@ func settleGPUFreeVRAM(gpus []GPU) {
 	const settleDelay = 400 * time.Millisecond
 	prev := busIDUsageMap(gpus)
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		time.Sleep(settleDelay)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(settleDelay):
+		}
 		cur := queryNVIDIAMemoryUsedMB()
 		if cur == nil {
 			return // nvidia-smi unavailable this round; keep the original reading
@@ -290,13 +304,22 @@ type nvidiaPCIeLink struct {
 	maxWidth     int
 }
 
+// parseCSVLine splits a CSV line by commas and trims whitespace from each field.
+func parseCSVLine(line string) []string {
+	parts := strings.Split(line, ",")
+	for i, p := range parts {
+		parts[i] = strings.TrimSpace(p)
+	}
+	return parts
+}
+
 func parseNVIDIAPCIeLinks(out string) []nvidiaPCIeLink {
 	var links []nvidiaPCIeLink
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		parts := strings.Split(line, ",")
+		parts := parseCSVLine(line)
 		if len(parts) < 4 {
 			continue
 		}
@@ -326,15 +349,15 @@ func applyNVIDIAPCIeLink(gpu *GPU, link nvidiaPCIeLink) {
 	if link.maxGen > 0 && link.currentWidth > 0 && link.maxWidth > 0 && link.currentWidth < link.maxWidth {
 		gen = link.maxGen
 		lanes = link.currentWidth
-		source = "observed_width"
+		source = BandwidthSourceObservedWidth
 	} else if link.maxGen > 0 && link.maxWidth > 0 {
 		gen = link.maxGen
 		lanes = link.maxWidth
-		source = "max"
+		source = BandwidthSourceMax
 	} else if link.currentGen > 0 && link.currentWidth > 0 {
 		gen = link.currentGen
 		lanes = link.currentWidth
-		source = "current"
+		source = BandwidthSourceCurrent
 	}
 	if gen <= 0 || lanes <= 0 {
 		return
@@ -459,13 +482,18 @@ func detectRAMLinux() RAMInfo {
 	totalMB := freeMB
 	// Try to get total from /proc/meminfo on Linux
 	if runtime.GOOS == "linux" {
-		data, _ := os.ReadFile("/proc/meminfo")
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "MemTotal:") {
-				var kb int
-				fmt.Sscanf(line, "MemTotal: %d kB", &kb)
-				totalMB = kb / 1024
-				break
+		f, err := os.Open("/proc/meminfo")
+		if err == nil {
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "MemTotal:") {
+					var kb int
+					fmt.Sscanf(line, "MemTotal: %d kB", &kb)
+					totalMB = kb / 1024
+					break
+				}
 			}
 		}
 	}
@@ -493,16 +521,21 @@ func detectCPU() CPUInfo {
 	flags := ""
 
 	if runtime.GOOS == "linux" {
-		data, _ := os.ReadFile("/proc/cpuinfo")
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "model name") {
-				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
-					model = strings.TrimSpace(parts[1])
+		f, err := os.Open("/proc/cpuinfo")
+		if err == nil {
+			defer f.Close()
+			scanner := bufio.NewScanner(f)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.HasPrefix(line, "model name") {
+					if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+						model = strings.TrimSpace(parts[1])
+					}
 				}
-			}
-			if strings.HasPrefix(line, "flags") {
-				if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
-					flags = strings.TrimSpace(parts[1])
+				if strings.HasPrefix(line, "flags") {
+					if parts := strings.SplitN(line, ":", 2); len(parts) == 2 {
+						flags = strings.TrimSpace(parts[1])
+					}
 				}
 			}
 		}
@@ -520,15 +553,18 @@ func detectCPU() CPUInfo {
 }
 
 func detectBackends() []Backend {
-	var backends []Backend
+	var detected []Backend
 	for _, name := range []string{"llama-server", "ik_llama", "ik_llama-server"} {
 		path, err := exec.LookPath(name)
 		if err != nil {
 			continue
 		}
-		backends = append(backends, Backend{Name: name, Path: path})
+		detected = append(detected, Backend{
+			Tag:  name,
+			Path: path,
+		})
 	}
-	return backends
+	return detected
 }
 
 // VRAMFreeMB returns free VRAM for this GPU.

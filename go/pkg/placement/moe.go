@@ -118,7 +118,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 	fixedPerGPU := make([]int, numGPUs)
 	expertOnlyFixedPerGPU := make([]int, numGPUs)
 	for i, g := range caps.GPUs {
-		computeBufMB := firstLaunchComputeBufMBForGPUParallel(model, s.UBatchSize, s.Parallel, i, gpuOrder)
+		computeBufMB := firstLaunchComputeBufMBForGPUParallel(model, s.UBatchSize, s.Parallel)
 		runtimeGrowthMB := 0
 		if pc != nil {
 			// Use the aggregate (primary) compute buffer for split-owner cost
@@ -524,7 +524,7 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 			nonExpertMB = totalSizeMB / 10
 		}
 		computeMB := firstLaunchComputeBufMB(model, s.UBatchSize)
-		cudaMB := 300 // conservative per-GPU CUDA context overhead
+		cudaMB := cudaOverheadFallbackMB // conservative per-GPU CUDA context overhead
 		freeVRAM := 0
 		for _, g := range caps.GPUs {
 			freeVRAM += g.VRAMFreeMB()
@@ -656,14 +656,12 @@ func buildOTStringFromAssignments(assignments []GPUAssignment, gpus []detect.GPU
 	return strings.Join(parts, ",")
 }
 
-func firstLaunchComputeBufMBForGPUParallel(model *ModelProfile, uBatch, parallel, gpuPos int, order []int) int {
+func firstLaunchComputeBufMBForGPUParallel(model *ModelProfile, uBatch, parallel int) int {
 	// Every device that owns regular split layers may need the full graph.
 	// llama-fit-params measured 8.9 GiB on CUDA0 and 8.7 GiB on CUDA2 for the
 	// same DeepSeek-V4 ub256/parallel4 plan. Discounting secondary owners by 50%
 	// overcommitted 12 GiB cards. Expert-only devices are capped separately by
 	// expertOnlyComputeReserveMB after their classification is known.
-	_ = gpuPos
-	_ = order
 	return firstLaunchComputeBufMBParallel(model, uBatch, parallel)
 }
 

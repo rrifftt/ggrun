@@ -1,10 +1,37 @@
 package placement
 
 import (
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/rrifftt/ggrun/pkg/detect"
 )
+
+func TestComputeKVTotalMBWarnsOnUnknownType(t *testing.T) {
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+
+	m := &ModelProfile{ModelArch: "llama", NumLayers: 32, HeadCountKV: 8, KeyLength: 64, ValueLength: 64, SlidingWindow: 0}
+	computeKVTotalMB(m, 32768, "q99_9")
+
+	w.Close()
+	os.Stderr = oldStderr
+
+	buf := make([]byte, 1024)
+	n, _ := r.Read(buf)
+	r.Close()
+
+	output := string(buf[:n])
+	expected := `WARNING: unknown KV type "q99_9"`
+	if !strings.Contains(output, expected) {
+		t.Fatalf("expected stderr to contain %q, got %q", expected, output)
+	}
+}
 
 func TestResolveAutoKVPlacement(t *testing.T) {
 	caps := &detect.Capabilities{GPUs: []detect.GPU{{VRAMTotalMB: 24576}, {VRAMTotalMB: 12288}, {VRAMTotalMB: 12288}}} // 48G
