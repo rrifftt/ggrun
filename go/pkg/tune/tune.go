@@ -12,6 +12,8 @@ import (
 )
 
 // Entry holds one tuning attempt result.
+const TuneSchemaVersion = 2
+
 type Entry struct {
 	Timestamp     int64                  `json:"timestamp"`
 	ModelPath     string                 `json:"model_path"`
@@ -26,6 +28,7 @@ type Entry struct {
 	Status        string                 `json:"status,omitempty"`
 	Result        BenchmarkResult        `json:"result"`
 	Best          bool                   `json:"best"`
+	SchemaVersion int                    `json:"schema_version"`
 }
 
 // BenchmarkResult mirrors benchmark.Result.
