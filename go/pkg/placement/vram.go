@@ -11,68 +11,51 @@ import (
 )
 
 func PredictVRAMUsage(model *ModelProfile, flags map[string]string, caps *detect.Capabilities) (neededMB, freeMB int) {
-	if caps == nil || len(caps.GPUs) == 0 {
-		return 0, 0
-	}
-	for _, g := range caps.GPUs {
-		freeMB += g.VRAMFreeMB()
-	}
-	// --fit on lets the backend auto-offload layers to fit KV on GPU.
-	// Don't predict OOM for these configs — let the backend handle it.
-	if v, ok := flags["--fit"]; ok && v == "on" {
-		return 0, freeMB
-	}
-
-	// 1. Model weights on GPU
-	ncpuMoe := 0
-	if v, ok := flags["--n-cpu-moe"]; ok {
-		ncpuMoe, _ = strconv.Atoi(v)
-	}
-	if model.IsMoE && ncpuMoe > 0 && model.ExpertBytes > 0 && model.NumLayers > 0 {
-		// MoE: non-expert weights + GPU-resident expert layers
-		nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
-		if nonExpertMB <= 0 {
-			nonExpertMB = model.TotalSizeMB / 10
-		}
-		expertPerLayerMB := bytesToMiBCeil(model.ExpertBytes / int64(model.NumLayers))
-		gpuExpertLayers := model.NumLayers - ncpuMoe
-		if gpuExpertLayers < 0 {
-			gpuExpertLayers = 0
-		}
-		neededMB += nonExpertMB + gpuExpertLayers*expertPerLayerMB
-	} else {
-		// Dense or full GPU: all weights on GPU
-		neededMB += model.TotalSizeMB
-	}
-
-	// 2. Context size (needed for compute buffer estimate)
-	ctxSize := model.ContextSize
-	if v, ok := flags["--ctx-size"]; ok {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			ctxSize = n
-		}
-	}
-
-	// 3. Compute buffer: empirical estimate from llama.cpp measurements.
-	// ~330 MB at 65536 ctx on a 9B model, scales linearly with context.
-	computeMB := ctxSize / 200
-	if computeMB < 128 {
-		computeMB = 128
-	}
-
-	// 4. Overhead: CUDA context + internal buffers + fragmentation.
-	// Measured ~300-500 MB on NVIDIA GPUs; 400 MB is a safe middle ground.
-	const overheadMB = 400
-
-	// Predict the actual allocation that fails: model weights + compute
-	// buffer + overhead. KV cache is allocated separately and the backend
-	// handles KV pressure via --fit or context reduction. Excluding KV
-	// avoids false positives on MoE models where model+KV exceeds free
-	// VRAM but the backend still fits both via lazy/mmap allocation.
-	neededMB = neededMB + computeMB + overheadMB
-	neededMB = neededMB * 105 / 100 // 5% margin for alignment
-
-	return neededMB, freeMB
+    if caps == nil || len(caps.GPUs) == 0 {
+        return 0, 0
+    }
+    for _, g := range caps.GPUs {
+        freeMB += g.VRAMFreeMB()
+    }
+    if v, ok := flags["--fit"]; ok && v == "on" {
+        return 0, freeMB
+    }
+    ctxSize := model.ContextSize
+    if v, ok := flags["--ctx-size"]; ok {
+        if n, err := strconv.Atoi(v); err == nil && n > 0 {
+            ctxSize = n
+        }
+    }
+    ubatch := 512
+    if v, ok := flags["-ub"]; ok {
+        if n, err := strconv.Atoi(v); err == nil && n > 0 {
+            ubatch = n
+        }
+    }
+    kvType := "f16"
+    if v, ok := flags["--cache-type-k"]; ok { kvType = v }
+    kvTotalMB := computeKVTotalMB(model, ctxSize, kvType)
+    
+    ncpuMoe := 0
+    if v, ok := flags["--n-cpu-moe"]; ok {
+        ncpuMoe, _ = strconv.Atoi(v)
+    }
+    
+    neededMB, _ = EstimateVRAMNeed(model, ctxSize, ubatch, kvTotalMB, caps, "")
+    
+    if model.IsMoE && ncpuMoe > 0 && model.ExpertBytes > 0 && model.NumLayers > 0 {
+        nonExpertMB := bytesToMiBCeil(model.NonExpertBytes)
+        if nonExpertMB <= 0 {
+            nonExpertMB = model.TotalSizeMB / 10
+        }
+        expertPerLayerMB := bytesToMiBCeil(model.ExpertBytes / int64(model.NumLayers))
+        gpuExpertLayers := model.NumLayers - ncpuMoe
+        if gpuExpertLayers < 0 {
+            gpuExpertLayers = 0
+        }
+        neededMB = nonExpertMB + gpuExpertLayers*expertPerLayerMB + (neededMB - model.TotalSizeMB)
+    }
+    return neededMB, freeMB
 }
 
 func ParseFlagsToMap(args []string) map[string]string {
@@ -235,3 +218,21 @@ func firstLaunchComputeBufMBParallel(model *ModelProfile, uBatch, parallel int) 
 	return est
 }
 
+
+
+// EstimateVRAMNeed is the single source of truth for VRAM fitting.
+func EstimateVRAMNeed(model *ModelProfile, ctxSize, ubatch int, kvTotalMB int, caps *detect.Capabilities, cacheDir string) (neededMB, totalFreeMB int) {
+    if caps == nil || len(caps.GPUs) == 0 {
+        return 0, 0
+    }
+    for _, g := range caps.GPUs {
+        totalFreeMB += g.VRAMFreeMB()
+    }
+    cudaOverheadMB := measuredCUDAOverheadMB(loadSystemProbe(cacheDir, caps.GPUs))
+    computeBufMB := computeFloorMB
+    if pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, "mid", "auto", "", caps.GPUs, 1); pc != nil {
+        computeBufMB = pc.ComputeBufMB
+    }
+    neededMB = model.TotalSizeMB + cudaOverheadMB + computeBufMB + kvTotalMB
+    return neededMB, totalFreeMB
+}

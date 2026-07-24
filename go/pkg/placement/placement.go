@@ -633,17 +633,6 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 		return CPUOnly
 	}
 
-	// Load measured CUDA overhead. Missing probe data is unknown and contributes 0;
-	// preflight/startup OOM recording supplies measured data for later launches.
-	cudaOverheadMB := measuredCUDAOverheadMB(loadSystemProbe(opts.CacheDir, caps.GPUs))
-
-	// Load model probe for compute buffer
-	computeBufMB := computeFloorMB // 1024 default
-	pc := loadProbeCache(opts.CacheDir, model, s.ContextSize, s.UBatchSize, s.KVQuality, s.KVPlacement, backendCacheTag(opts), caps.GPUs, s.Parallel)
-	if pc != nil {
-		computeBufMB = pc.ComputeBufMB
-	}
-
 	// Single GPU: model + overhead fits in best GPU
 	// Use FREE VRAM (desktop/compositor uses some VRAM)
 	bestFreeVRAM := 0
@@ -662,8 +651,8 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 	if s.KVPlacement == "cpu" {
 		gpuKVMB = 0
 	}
-	singleGPUNeeded := totalSizeMB + cudaOverheadMB + computeBufMB + gpuKVMB
-	if singleGPUNeeded <= bestFreeVRAM {
+	neededMB, _ := EstimateVRAMNeed(model, s.ContextSize, s.UBatchSize, gpuKVMB, caps, opts.CacheDir)
+	if neededMB <= bestFreeVRAM {
 		return SingleGPU
 	}
 
@@ -673,9 +662,8 @@ func chooseStrategy(caps *detect.Capabilities, model *ModelProfile, s *Strategy,
 		for _, g := range caps.GPUs {
 			totalFreeVRAM += g.VRAMFreeMB()
 		}
-		// Use measured overhead per GPU: model + (cudaOverhead + computeBuf) * numGPUs + KV
-		vramNeeded := totalSizeMB + (cudaOverheadMB+computeBufMB)*numGPUs + gpuKVMB
-		if vramNeeded <= totalFreeVRAM {
+		neededMBMulti, _ := EstimateVRAMNeed(model, s.ContextSize, s.UBatchSize, gpuKVMB, caps, opts.CacheDir)
+		if neededMBMulti <= totalFreeVRAM {
 			return MultiGPUDense
 		}
 	}
