@@ -100,33 +100,33 @@ type Info struct {
 	ContextLength      int    `json:"ctx_train"`
 	EmbeddingLength    int    `json:"embd"`
 	FeedForwardLength  int    `json:"ff"`
-	HeadCountKV        int    `json:"hkv"` // Deprecated: use Info.Attention.HeadCountKV
-	KeyLength          int    `json:"kl"` // Deprecated: use Info.Attention.KeyLength
-	ValueLength        int    `json:"vl"` // Deprecated: use Info.Attention.ValueLength
+	HeadCountKV        int    `json:"hkv"`
+	KeyLength          int    `json:"kl"`
+	ValueLength        int    `json:"vl"`
 	VocabSize          int    `json:"vocab_size"`
 	TokenizerModel     string `json:"tokenizer_model"`
 	TokenizerPre       string `json:"tokenizer_pre"`
 	TokenizerHash      string `json:"tokenizer_hash"`
-	ExpertBytes        int64  `json:"expert_bytes"` // Deprecated: use Info.MoE.ExpertBytes
-	NonExpertBytes     int64  `json:"non_expert_bytes"` // Deprecated: use Info.MoE.NonExpertBytes
+	ExpertBytes        int64  `json:"expert_bytes"`
+	NonExpertBytes     int64  `json:"non_expert_bytes"`
 	TokenEmbdBytes     int64  `json:"token_embd_bytes"`
 	OutputBytes        int64  `json:"output_bytes"`
-	ShexpBytes         int64  `json:"shexp_bytes"` // Deprecated: use Info.MoE.ShexpBytes
-	Fused              int    `json:"fused"` // Deprecated: use Info.MoE.Fused
-	Experts            int    `json:"experts"` // Deprecated: use Info.MoE.Experts
-	ExpertUsed         int    `json:"exp_used"` // Deprecated: use Info.MoE.ExpertUsed
-	ExpFF              int    `json:"exp_ff"` // Deprecated: use Info.MoE.ExpFF
-	ExpSharedFF        int    `json:"exp_shared_ff"` // Deprecated: use Info.MoE.ExpSharedFF
+	ShexpBytes         int64  `json:"shexp_bytes"`
+	Fused              int    `json:"fused"`
+	Experts            int    `json:"experts"`
+	ExpertUsed         int    `json:"exp_used"`
+	ExpFF              int    `json:"exp_ff"`
+	ExpSharedFF        int    `json:"exp_shared_ff"`
 	NRot               int    `json:"n_rot"`
-	SSM                int    `json:"ssm"` // Deprecated: use Info.SSM.SSM
-	FullAttnInterval   int    `json:"full_interval"` // Deprecated: use Info.SSM.FullAttnInterval
-	SlidingWindow      int    `json:"swa"` // Deprecated: use Info.Attention.SlidingWindow
+	SSM                int    `json:"ssm"`
+	FullAttnInterval   int    `json:"full_interval"`
+	SlidingWindow      int    `json:"swa"`
 	LeadingDense       int    `json:"leading_dense"`
-	KVLoraRank         int    `json:"kv_lora"` // Deprecated: use Info.MLA.KVLoraRank
-	QLoraRank          int    `json:"q_lora"` // Deprecated: use Info.MLA.QLoraRank
-	KeyLengthMLA       int    `json:"kl_mla"` // Deprecated: use Info.MLA.KeyLengthMLA
-	ValueLengthMLA     int    `json:"vl_mla"` // Deprecated: use Info.MLA.ValueLengthMLA
-	HasShexp           bool   `json:"has_shexp"` // Deprecated: use Info.MoE.HasShexp
+	KVLoraRank         int    `json:"kv_lora"`
+	QLoraRank          int    `json:"q_lora"`
+	KeyLengthMLA       int    `json:"kl_mla"`
+	ValueLengthMLA     int    `json:"vl_mla"`
+	HasShexp           bool   `json:"has_shexp"`
 	NextNPredictLayers int    `json:"nextn_predict_layers"`
 	IsMoE              bool   `json:"is_moe"`
 
