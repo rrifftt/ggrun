@@ -21,7 +21,6 @@ import (
 	"github.com/rrifftt/ggrun/pkg/config"
 	"github.com/rrifftt/ggrun/pkg/detect"
 	"github.com/rrifftt/ggrun/pkg/gguf"
-	"github.com/rrifftt/ggrun/pkg/libhub"
 	"github.com/rrifftt/ggrun/pkg/placement"
 	"github.com/rrifftt/ggrun/pkg/probe"
 	"github.com/rrifftt/ggrun/pkg/recovery"
@@ -89,7 +88,6 @@ Launch flags:
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
   -vision              Enable vision (auto-detect mmproj)
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
-  --profile string     Placement bias: balanced|decode|prefill (default balanced)
   --profile string     Placement bias: balanced|decode|prefill (default balanced)
 `)
 }
@@ -1331,17 +1329,9 @@ func applyTuneCache(req *launchRequest, serverArgs []string, cacheDir, backendTa
 	}
 	path := bestTuneCachePath(cacheDir, filepath.Base(req.ModelPath), backendTag, vision, tuneHardwareHash(caps))
 	if path == "" {
-		// No local tune for this model+hardware+backend: try the community
-		// pool. Downloads are sanitized to the tune-flag allow-list and both
-		// hits and misses are cached on disk, so launches stay offline-safe.
-		path = tune.FetchCommunityTune(cacheDir, req.ModelPath, gpuNamesFromCaps(caps), vision, backendTag)
-		if path == "" {
-			return serverArgs
-		}
-		fmt.Printf("[tune] Using community-shared config: %s (LLM_COMMUNITY_TUNES=off to disable)\n", filepath.Base(path))
-	} else {
-		fmt.Printf("[tune] Auto-selected cached config: %s\n", filepath.Base(path))
+		return serverArgs
 	}
+	fmt.Printf("[tune] Auto-selected cached config: %s\n", filepath.Base(path))
 	autoReq := *req
 	autoReq.TuneCache = path
 	return applySelectedTuneCache(&autoReq, serverArgs, caps)
@@ -2022,10 +2012,6 @@ func cmdTune(args []string) {
 
 	// Print final results to stderr so they don't mess up the terminal
 	fmt.Fprintf(os.Stderr, "[tune] Best config: %.1f tok/s\n", entry.Result.GenTPS)
-	tunePath := tune.TuneCachePath(cfg.CacheDir, req.ModelPath, gpuNamesFromCaps(caps), strategy.MMProjPath != "", be.Tag)
-	if hint := tune.ShareHint(tunePath); hint != "" {
-		fmt.Fprintln(os.Stderr, hint)
-	}
 }
 
 // guardPortFree refuses to start when something is already listening on the
@@ -2429,10 +2415,6 @@ func backendSearchPaths() []string {
 func detectBackend(path string) *backendInfo {
 	info := &backendInfo{Path: path, Tag: "llama", Dialect: "llama"}
 	cmd := exec.Command(path, "--help")
-	if hubDir, ok, _ := libhub.Setup(path); ok {
-		defer libhub.Cleanup(hubDir)
-		cmd.Env = libhub.ApplyHubToChildEnv(os.Environ(), hubDir)
-	}
 	out, _ := cmd.CombinedOutput()
 	help := string(out)
 	info.Help = help
@@ -2460,10 +2442,6 @@ func detectBackend(path string) *backendInfo {
 
 func backendBuildIdentity(path string) string {
 	cmd := exec.Command(path, "--version")
-	if hubDir, ok, _ := libhub.Setup(path); ok {
-		defer libhub.Cleanup(hubDir)
-		cmd.Env = libhub.ApplyHubToChildEnv(os.Environ(), hubDir)
-	}
 	out, _ := cmd.CombinedOutput()
 	material := strings.TrimSpace(string(out))
 	if fi, err := os.Stat(path); err == nil {

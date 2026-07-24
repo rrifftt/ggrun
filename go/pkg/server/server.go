@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/rrifftt/ggrun/pkg/libhub"
 )
 
 // Process wraps a running llama-server subprocess.
+
 type Process struct {
 	Cmd    *exec.Cmd
 	Port   int
@@ -198,7 +198,7 @@ func ChildEnv(env, args []string) []string {
 	if !hasQueueOverride && hasMultiGPUSplit(args) {
 		filtered = append(filtered, "CUDA_SCALE_LAUNCH_QUEUES=4x")
 	}
-	return libhub.ApplyToChildEnv(filtered)
+	return filtered
 }
 
 func hasMultiGPUSplit(args []string) bool {

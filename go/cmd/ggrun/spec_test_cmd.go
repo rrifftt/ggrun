@@ -10,7 +10,6 @@ import (
 
 	"github.com/rrifftt/ggrun/pkg/config"
 	"github.com/rrifftt/ggrun/pkg/detect"
-	"github.com/rrifftt/ggrun/pkg/libhub"
 	"github.com/rrifftt/ggrun/pkg/placement"
 	"github.com/rrifftt/ggrun/pkg/specbench"
 )
@@ -96,13 +95,6 @@ func runSpecTest(args []string) error {
 	if env := applyGPUVisibility(req, backendDialect(be)); env != "" {
 		fmt.Printf("[spec-test] GPU restriction: %s\n", env)
 	}
-	if hubDir, ok, setupErr := libhub.Setup(be.Path); setupErr != nil {
-		fmt.Fprintf(os.Stderr, "[spec-test] warning: lib hub: %v\n", setupErr)
-	} else if ok {
-		os.Setenv("LLM_SERVER_LIB_HUB", hubDir)
-		defer libhub.Cleanup(hubDir)
-	}
-
 	report := specTestReport{
 		Model: req.ModelPath, BackendIdentity: be.Identity,
 		MeasuredAt: time.Now().UTC().Format(time.RFC3339), Rounds: rounds,
