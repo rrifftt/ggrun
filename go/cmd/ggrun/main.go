@@ -28,9 +28,6 @@ import (
 	"github.com/rrifftt/ggrun/pkg/tune"
 )
 
-// version is the build version; release builds override it via -ldflags.
-const version = "0.1.0"
-
 func main() {
 	if len(os.Args) < 2 {
 		usage()
