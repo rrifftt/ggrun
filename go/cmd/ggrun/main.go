@@ -88,6 +88,8 @@ Launch flags:
   --ram-headroom str   Reserve system RAM the recommender/placement won't use, e.g. 8G
   -vision              Enable vision (auto-detect mmproj)
   --spec string        Speculative decoding: off|auto|mtp|dflash|eagle3|draft|ngram|ngram-mod|ngram-k4v
+  --profile string     Placement bias: balanced|decode|prefill (default balanced)
+  --profile string     Placement bias: balanced|decode|prefill (default balanced)
 `)
 }
 

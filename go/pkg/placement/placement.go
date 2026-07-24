@@ -61,6 +61,15 @@ const (
 	expertOnlyMaxBandwidthRatio = 0.33
 )
 
+// Profile is a workload hint that biases placement decisions.
+type Profile string
+
+const (
+    ProfileBalanced Profile = "balanced"
+    ProfileDecode   Profile = "decode"
+    ProfilePrefill  Profile = "prefill"
+)
+
 // StrategyType selects how the model is placed.
 type StrategyType string
 
@@ -197,6 +206,7 @@ type Options struct {
 	VRAMHeadroomMB  int // hold back this much total VRAM as a safety margin
 	RAMHeadroomMB   int // hold back this much system RAM as a safety margin
 	BackendTag      string
+	Profile        Profile
 	BackendHelp     string // backend --help output; gates turbo KV types // "llama" or "ik_llama"
 	BackendCacheTag string // backend identity for probe/cache isolation; defaults to BackendTag
 	BackendIdentity string // exact backend build/commit identity for speculative performance profiles

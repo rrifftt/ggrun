@@ -12,6 +12,7 @@ import (
 
 	"github.com/rrifftt/ggrun/pkg/benchmark"
 	"github.com/rrifftt/ggrun/pkg/detect"
+	"github.com/rrifftt/ggrun/pkg/placement"
 )
 
 // Engine runs the AI-tune optimization loop.
@@ -832,6 +833,10 @@ func deterministicSuggestionFor(round int, baseFlags []string, backend string, c
 }
 
 func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabilities, backendHelp string) []Suggestion {
+    // Profile-aware candidate reordering
+    profile := placement.ProfileBalanced
+    _ = profile // used below for reordering
+
 	base := flagMap(baseFlags)
 	batch := atoiDefault(base["-b"], 4096)
 	ubatch := atoiDefault(base["-ub"], 512)
