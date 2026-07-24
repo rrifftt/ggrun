@@ -9,16 +9,22 @@ import (
 )
 
 var (
-    kernel32       = syscall.NewLazyDLL("kernel32.dll")
-    procLockFile   = kernel32.NewProc("LockFile")
-    procUnlockFile = kernel32.NewProc("UnlockFile")
+    kernel32         = syscall.NewLazyDLL("kernel32.dll")
+    procLockFileEx   = kernel32.NewProc("LockFileEx")
+    procUnlockFileEx = kernel32.NewProc("UnlockFileEx")
 )
 
 func lockFile(f *os.File) error {
     const LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
-    const LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
     var ol syscall.Overlapped
-    ret, _, err := procLockFile.Call(f.Fd(), 1, 0, 0, 1, uintptr(LOCKFILE_EXCLUSIVE_LOCK), 0, 0, uintptr(unsafe.Pointer(&ol)))
+    ret, _, err := procLockFileEx.Call(
+        f.Fd(),
+        uintptr(LOCKFILE_EXCLUSIVE_LOCK),
+        0,
+        1,
+        0,
+        uintptr(unsafe.Pointer(&ol)),
+    )
     if ret == 0 {
         return err
     }
@@ -27,7 +33,13 @@ func lockFile(f *os.File) error {
 
 func unlockFile(f *os.File) error {
     var ol syscall.Overlapped
-    ret, _, err := procUnlockFile.Call(f.Fd(), 0, 0, 1, 0, 0, 0, uintptr(unsafe.Pointer(&ol)))
+    ret, _, err := procUnlockFileEx.Call(
+        f.Fd(),
+        0,
+        1,
+        0,
+        uintptr(unsafe.Pointer(&ol)),
+    )
     if ret == 0 {
         return err
     }
