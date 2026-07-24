@@ -2,6 +2,7 @@ package detect
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -88,6 +89,9 @@ func detectNVIDIA() []GPU {
 		"--query-gpu=index,pci.bus_id,name,memory.total,memory.used,driver_version,compute_cap",
 		"--format=csv,noheader,nounits").Output()
 	if err != nil {
+		if !errors.Is(err, exec.ErrNotFound) {
+			fmt.Fprintf(os.Stderr, "ggrun: nvidia-smi ran but failed: %v\n", err)
+		}
 		return nil
 	}
 	// Query PCIe bandwidth separately. Link speed often idles down to Gen1 when

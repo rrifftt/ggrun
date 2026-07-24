@@ -1,1 +1,1 @@
-remove temp files
+[phase7] polish, robustness, and docs
