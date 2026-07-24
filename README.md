@@ -56,7 +56,15 @@ go/
 ├── cmd/ggrun/       CLI, launch orchestration, OOM recovery
 └── pkg/
     ├── placement/   Strategy computation, KV sizing, MoE expert packing, VRAM predictor
-    ├── tune/        auto-tune engine, tiered deterministic plan, refinement pass, cache format
+    │   ├── placement.go    Types, Compute entry, chooseStrategy
+    │   ├── moe.go          MoE expert packing, offload strategies
+    │   ├── dense.go        Single/Multi-GPU and CPU-only dense strategies
+    │   ├── kv.go           KV cache sizing and placement resolution
+    │   ├── vram.go         VRAM prediction and accounting
+    │   ├── cram.go         Prompt cache (CRAM) sizing
+    │   ├── probe_cache.go  Probe cache I/O and placement persistence
+    │   └── gpu_order.go    GPU ordering and arithmetic helpers
+    ├── tune/        Auto-tune engine, tiered deterministic plan, refinement pass, cache format
     ├── gguf/        Pure-Go GGUF parser
     ├── detect/      Hardware detection (GPU, CPU, RAM, backends)
     ├── benchmark/   HTTP benchmark runner
