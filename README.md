@@ -1,6 +1,6 @@
 # ggrun
 
-AI-tuned llama.cpp launcher with automatic GPU/CPU placement, MoE expert offload, and hardware-aware KV cache management. Point it at a GGUF model and it figures out the optimal `llama-server` flags for your exact hardware.
+auto-tuned llama.cpp launcher with automatic GPU/CPU placement, MoE expert offload, and hardware-aware KV cache management. Point it at a GGUF model and it figures out the optimal `llama-server` flags for your exact hardware.
 
 ## Results
 
@@ -44,7 +44,7 @@ CGO_ENABLED=0 go build -o ggrun ./cmd/ggrun/
 ```bash
 ./ggrun detect                          # detect hardware
 ./ggrun dry-run model.gguf --ctx 65536  # preview flags without launching
-./ggrun tune model.gguf --rounds 8      # AI-tune (~5 min)
+./ggrun tune model.gguf --rounds 8      # auto-tune (~5 min)
 ./ggrun model.gguf --ctx 65536          # launch with cached tune
 ./ggrun model.gguf --gpus 0,2           # multi-GPU
 ```
@@ -56,7 +56,7 @@ go/
 ├── cmd/ggrun/       CLI, launch orchestration, OOM recovery
 └── pkg/
     ├── placement/   Strategy computation, KV sizing, MoE expert packing, VRAM predictor
-    ├── tune/        AI-tune engine, tiered deterministic plan, refinement pass, cache format
+    ├── tune/        auto-tune engine, tiered deterministic plan, refinement pass, cache format
     ├── gguf/        Pure-Go GGUF parser
     ├── detect/      Hardware detection (GPU, CPU, RAM, backends)
     ├── benchmark/   HTTP benchmark runner

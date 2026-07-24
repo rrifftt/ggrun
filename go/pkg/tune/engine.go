@@ -1,10 +1,9 @@
 package tune
 
 import (
-	"bytes"
+
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -89,7 +88,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	}
 
 	if e.OnProgress != nil {
-		e.OnProgress(fmt.Sprintf("AI-tune: starting %d rounds for %s", e.Rounds, modelPath))
+		e.OnProgress(fmt.Sprintf("auto-tune: starting %d rounds for %s", e.Rounds, modelPath))
 	}
 
 	var baselineCleanup func()
@@ -140,7 +139,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	consecutiveWasted := 0 // tracks rounds that produced no useful candidate
 	for round := 1; round <= e.Rounds; {
 		if e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: round %d/%d (best %.1f tok/s)", round, e.Rounds, best.Result.GenTPS))
+			e.OnProgress(fmt.Sprintf("auto-tune: round %d/%d (best %.1f tok/s)", round, e.Rounds, best.Result.GenTPS))
 		}
 
 		var suggestion *Suggestion
@@ -156,20 +155,20 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			key := suggestionKey(o)
 			if triedCandidates[key] {
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q duplicates an earlier flag set", c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: candidate %q duplicates an earlier flag set", c.Name))
 				}
 				continue
 			}
 			if isSkippedDueToOOM(o, crashedFlagSets, initialFlags) {
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q due to predicted OOM", c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: skipping candidate %q due to predicted OOM", c.Name))
 				}
 				continue
 			}
 			f := ApplyOverrides(initialFlags, o, protected)
 			if equalFlags(initialFlags, f) {
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q made no effective flag changes", c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: candidate %q made no effective flag changes", c.Name))
 				}
 				continue
 			}
@@ -181,88 +180,67 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 		}
 
 		if suggestion == nil {
-			// Deterministic candidates exhausted; fall back to LLM.
-			if err := startBaseline(); err != nil {
-				return best, fmt.Errorf("restart baseline for round %d query: %w", round, err)
+			suggestion = deterministicSuggestionFor(round, initialFlags, e.Backend, e.Caps, e.BackendHelp)
+		}
+		if suggestion == nil {
+			if e.OnProgress != nil {
+				e.OnProgress("auto-tune: no safe candidates left, stopping early")
 			}
-			var err error
-			var crashedNames []string
-			for _, c := range crashedFlagSets {
-				for k, v := range c {
-					if v != nil && v != true {
-						crashedNames = append(crashedNames, fmt.Sprintf("%s=%v", k, v))
-					} else {
-						crashedNames = append(crashedNames, k)
-					}
-				}
+			break
+		}
+		overrides = sanitizeFlagValues(suggestion.FlagValues, protected)
+		overrides = guardRiskyMoEOverrides(overrides, initialFlags)
+		candidateKey := suggestionKey(overrides)
+		if triedCandidates[candidateKey] {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("auto-tune: candidate %q duplicates an earlier flag set", suggestion.Name))
 			}
-			suggestion, err = e.queryLLM(modelPath, best, crashedNames)
-			if err != nil && e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: LLM query failed in round %d: %v; using deterministic candidate", round, err))
-			}
-			if err != nil || suggestion == nil || len(sanitizeFlagValues(suggestion.FlagValues, protected)) == 0 {
-				suggestion = deterministicSuggestionFor(round, initialFlags, e.Backend, e.Caps, e.BackendHelp)
-			}
-			if suggestion == nil {
+			consecutiveWasted++
+			if consecutiveWasted >= 3 {
 				if e.OnProgress != nil {
-					e.OnProgress("AI-tune: no safe candidates left, stopping early")
+					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
 				}
 				break
 			}
-			overrides = sanitizeFlagValues(suggestion.FlagValues, protected)
-			overrides = guardRiskyMoEOverrides(overrides, initialFlags)
-			candidateKey := suggestionKey(overrides)
-			if triedCandidates[candidateKey] {
-				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q duplicates an earlier flag set", suggestion.Name))
-				}
-				consecutiveWasted++
-				if consecutiveWasted >= 3 {
-					if e.OnProgress != nil {
-						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
-					}
-					break
-				}
-				round++
-				continue
-			}
-			if isSkippedDueToOOM(overrides, crashedFlagSets, initialFlags) {
-				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q due to predicted OOM", suggestion.Name))
-				}
-				consecutiveWasted++
-				if consecutiveWasted >= 3 {
-					if e.OnProgress != nil {
-						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
-					}
-					break
-				}
-				round++
-				continue
-			}
-			candidateFlags = ApplyOverrides(initialFlags, overrides, protected)
-			if equalFlags(initialFlags, candidateFlags) {
-				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: candidate %q made no effective flag changes", suggestion.Name))
-				}
-				consecutiveWasted++
-				if consecutiveWasted >= 3 {
-					if e.OnProgress != nil {
-						e.OnProgress("AI-tune: 3 consecutive wasted rounds, stopping early")
-					}
-					break
-				}
-				round++
-				continue
-			}
-			triedCandidates[candidateKey] = true
+			round++
+			continue
 		}
+		if isSkippedDueToOOM(overrides, crashedFlagSets, initialFlags) {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("auto-tune: skipping candidate %q due to predicted OOM", suggestion.Name))
+			}
+			consecutiveWasted++
+			if consecutiveWasted >= 3 {
+				if e.OnProgress != nil {
+					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
+				}
+				break
+			}
+			round++
+			continue
+		}
+		candidateFlags = ApplyOverrides(initialFlags, overrides, protected)
+		if equalFlags(initialFlags, candidateFlags) {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("auto-tune: candidate %q made no effective flag changes", suggestion.Name))
+			}
+			consecutiveWasted++
+			if consecutiveWasted >= 3 {
+				if e.OnProgress != nil {
+					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
+				}
+				break
+			}
+			round++
+			continue
+		}
+		triedCandidates[candidateKey] = true
 
 		// Pre-launch OOM prediction: skip candidates that are mathematically
 		// guaranteed to OOM, saving 30-60s per skipped candidate.
 		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
 			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
+				e.OnProgress(fmt.Sprintf("auto-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
 			}
 			crashed := Entry{
 				Timestamp:     Now(),
@@ -308,7 +286,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			// Record the flags that caused the crash to prune future candidates
 			crashedFlagSets = append(crashedFlagSets, overrides)
 			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: candidate benchmark failed: %v", err))
+				e.OnProgress(fmt.Sprintf("auto-tune: candidate benchmark failed: %v", err))
 			}
 		} else {
 			candidate.Name = suggestion.Name
@@ -337,7 +315,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			if candidate.Best {
 				best = candidate
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: new best %.1f tok/s (%s)", best.Result.GenTPS, suggestion.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: new best %.1f tok/s (%s)", best.Result.GenTPS, suggestion.Name))
 				}
 			}
 		}
@@ -355,7 +333,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	// applies — a config that is slower than the default on every future launch.
 	if best != nil && baseline != nil && best != baseline && len(best.OverrideFlags) > 0 {
 		if e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: confirming %s against baseline...", best.Name))
+			e.OnProgress(fmt.Sprintf("auto-tune: confirming %s against baseline...", best.Name))
 		}
 		stopBaseline()
 		bestFlags := ApplyOverrides(initialFlags, best.OverrideFlags, protected)
@@ -364,7 +342,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 		switch {
 		case errBase != nil || errBest != nil:
 			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: confirmation benchmark failed; keeping baseline instead of %s", best.Name))
+				e.OnProgress(fmt.Sprintf("auto-tune: confirmation benchmark failed; keeping baseline instead of %s", best.Name))
 			}
 			best.Best = false
 			baseline.Best = true
@@ -374,11 +352,11 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			baseline.Result = confBase.Result
 			best.Result = confBest.Result
 			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: confirmed %.1f tok/s vs baseline %.1f", best.Result.GenTPS, baseline.Result.GenTPS))
+				e.OnProgress(fmt.Sprintf("auto-tune: confirmed %.1f tok/s vs baseline %.1f", best.Result.GenTPS, baseline.Result.GenTPS))
 			}
 		default:
 			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("AI-tune: %s did not hold up on re-measure (%.1f vs baseline %.1f); keeping baseline", best.Name, confBest.Result.GenTPS, confBase.Result.GenTPS))
+				e.OnProgress(fmt.Sprintf("auto-tune: %s did not hold up on re-measure (%.1f vs baseline %.1f); keeping baseline", best.Name, confBest.Result.GenTPS, confBase.Result.GenTPS))
 			}
 			best.Best = false
 			baseline.Best = true
@@ -395,7 +373,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	// =================================================================
 	if e.RefinementRounds > 0 && best != nil && best != baseline && len(best.OverrideFlags) > 0 {
 		if e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: refinement pass (%d rounds) on top of %s...", e.RefinementRounds, best.Name))
+			e.OnProgress(fmt.Sprintf("auto-tune: refinement pass (%d rounds) on top of %s...", e.RefinementRounds, best.Name))
 		}
 		winnerFlags := ApplyOverrides(initialFlags, best.OverrideFlags, protected)
 		refPlan := refinementPlan(winnerFlags, e.Backend, e.Caps, e.BackendHelp)
@@ -405,13 +383,13 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			candidateFlags := ApplyOverrides(winnerFlags, o, protected)
 			if equalFlags(winnerFlags, candidateFlags) {
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: refinement candidate %q made no effective flag changes", c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: refinement candidate %q made no effective flag changes", c.Name))
 				}
 				continue
 			}
 			if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: skipping refinement candidate %q (predicted OOM)", c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: skipping refinement candidate %q (predicted OOM)", c.Name))
 				}
 				continue
 			}
@@ -435,7 +413,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				e.addCache(&crashed)
 				entries = append(entries, crashed)
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: refinement candidate failed: %v", err))
+					e.OnProgress(fmt.Sprintf("auto-tune: refinement candidate failed: %v", err))
 				}
 				continue
 			}
@@ -450,7 +428,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				best = candidate
 				winnerFlags = ApplyOverrides(initialFlags, best.OverrideFlags, protected)
 				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("AI-tune: refinement new best %.1f tok/s (%s)", best.Result.GenTPS, c.Name))
+					e.OnProgress(fmt.Sprintf("auto-tune: refinement new best %.1f tok/s (%s)", best.Result.GenTPS, c.Name))
 				}
 			}
 			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
@@ -458,15 +436,15 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	}
 
 	if e.OnProgress != nil {
-		e.OnProgress(fmt.Sprintf("AI-tune: done. Best result: %.1f tok/s", best.Result.GenTPS))
+		e.OnProgress(fmt.Sprintf("auto-tune: done. Best result: %.1f tok/s", best.Result.GenTPS))
 	}
 
 	if e.Cache != nil {
 		path, err := e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, true)
 		if err != nil && e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: failed to save tune cache: %v", err))
+			e.OnProgress(fmt.Sprintf("auto-tune: failed to save tune cache: %v", err))
 		} else if path != "" && e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: saved tune cache %s", path))
+			e.OnProgress(fmt.Sprintf("auto-tune: saved tune cache %s", path))
 		}
 	}
 
@@ -483,7 +461,7 @@ func (e *Engine) saveTuneProgress(modelPath string, baseline, best *Entry, entri
 	}
 	if !final && e.OnProgress != nil {
 		if _, statErr := os.Stat(path); statErr == nil {
-			e.OnProgress(fmt.Sprintf("AI-tune: progress saved %s", path))
+			e.OnProgress(fmt.Sprintf("auto-tune: progress saved %s", path))
 		}
 	}
 	return path, nil
@@ -586,95 +564,6 @@ func (e *Engine) startServerWithTimeout(flags []string) (cleanup func(), err err
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("server startup timed out after %v", timeout)
 	}
-}
-
-func (e *Engine) queryLLM(modelPath string, best *Entry, crashedNames []string) (*Suggestion, error) {
-	prompt := buildTuningPrompt(modelPath, best, e.Caps, crashedNames)
-	body := map[string]interface{}{
-		"model":                e.Model,
-		"messages":             []map[string]string{{"role": "user", "content": prompt}},
-		"max_tokens":           512,
-		"temperature":          0.3,
-		"chat_template_kwargs": map[string]bool{"enable_thinking": false},
-	}
-	data, _ := json.Marshal(body)
-	client := &http.Client{Timeout: 3 * time.Minute}
-	resp, err := client.Post(e.BaseURL+"/v1/chat/completions", "application/json", bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var out struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	if len(out.Choices) == 0 {
-		return nil, fmt.Errorf("no choices in LLM response")
-	}
-
-	content := out.Choices[0].Message.Content
-	// Try to find JSON in the response.
-	jsonStart := strings.Index(content, "{")
-	jsonEnd := strings.LastIndex(content, "}")
-	if jsonStart >= 0 && jsonEnd > jsonStart {
-		content = content[jsonStart : jsonEnd+1]
-	}
-
-	var suggestion Suggestion
-	if err := json.Unmarshal([]byte(content), &suggestion); err != nil {
-		return nil, fmt.Errorf("failed to parse suggestion JSON: %w", err)
-	}
-	if suggestion.Name == "" {
-		suggestion.Name = "llm-suggestion"
-	}
-	return &suggestion, nil
-}
-
-func buildTuningPrompt(modelPath string, best *Entry, caps *detect.Capabilities, crashedNames []string) string {
-	gpuCount := 0
-	totalVRAM := 0
-	cpuModel := "unknown"
-	if caps != nil {
-		gpuCount = len(caps.GPUs)
-		totalVRAM = caps.TotalVRAM()
-		cpuModel = caps.CPU.Model
-	}
-	return fmt.Sprintf(`You are a performance optimization engineer for llama.cpp inference.
-
-Current model: %s
-Hardware: %d GPUs, %d MB total VRAM, %s CPU
-Current performance: %.1f prefill tok/s, %.1f decode tok/s
-Current flags: %v
-Recent candidates that crashed with OOM: %v
-
-Suggest llama-server command-line flag changes to improve throughput.
-Return ONLY a JSON object with this exact format:
-{"name":"short name","flags":{"--flag":"value"},"reasoning":"why"}
-
-Rules:
-Only suggest flags that affect performance: batch, microbatch, threads, flash attention, mmap/mlock, defrag threshold, or ik_llama MoE runtime flags
-Do not change model path, port, host, context size, parallel, mmproj, tensor split, main GPU, device, n-gpu-layers, or override-tensor. Context size and parallel sequence slots are user-owned.
-You may suggest cache type changes if they enable a better placement (e.g., GPU KV with a smaller cache type to fit within VRAM).
-Keep suggestions conservative (1-2 flag changes per round)
-Use false for a currently-present boolean flag when you want to test removing it
-Previous crashes indicate VRAM pressure. Try reducing batch size, using smaller KV cache types, or offloading more to CPU.
-If current performance is already good, say so with empty flags`,
-		modelPath,
-		gpuCount,
-		totalVRAM,
-		cpuModel,
-		best.Result.PromptTPS,
-		best.Result.GenTPS,
-		best.Flags,
-		crashedNames,
-	)
 }
 
 func removeConflicting(flags []string, newFlag string) []string {

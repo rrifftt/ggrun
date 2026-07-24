@@ -72,7 +72,7 @@ Commands:
   kv-probe <model>     Measure real KV cache size (2 short launches) and cache it,
                        so context sizing is exact for compressed-attention models
   dry-run <model.gguf> Print computed flags without launching
-  tune <model.gguf>    AI-tune model for best performance
+  tune <model.gguf>    auto-tune model for best performance
   spec-test <model>    Verify MTP ceilings 1-4 against a target-only baseline
 
 Launch flags:
