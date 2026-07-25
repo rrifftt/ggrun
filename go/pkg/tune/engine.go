@@ -175,6 +175,8 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			}
 			triedCandidates[key] = true
 			suggestion = &c
+			overrides = o
+			candidateFlags = f
 			break
 		}
 
