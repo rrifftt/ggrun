@@ -29,7 +29,6 @@ type Engine struct {
 	ServerStartupTimeout time.Duration
 	BackendHelp          string
 	RefinementRounds     int // 2nd-pass: compute knobs (b/ub/t/tb) on top of the winner
-	PredictOOM           func(candidateFlags []string) bool // pre-launch VRAM prediction
 	OnProgress           func(msg string)
 	StartServer          func(flags []string) (cleanup func(), err error)
 
@@ -173,7 +172,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				}
 				continue
 			}
-			triedCandidates[key] = true
 			suggestion = &c
 			overrides = o
 			candidateFlags = f
@@ -236,33 +234,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			continue
 		}
 		triedCandidates[candidateKey] = true
-
-		// Pre-launch OOM prediction: skip candidates that are mathematically
-		// guaranteed to OOM, saving 30-60s per skipped candidate.
-		if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
-			if e.OnProgress != nil {
-				e.OnProgress(fmt.Sprintf("auto-tune: skipping candidate %q (predicted OOM)", suggestion.Name))
-			}
-			crashed := Entry{
-				Timestamp:     Now(),
-				ModelPath:     modelPath,
-				ModelName:     e.Model,
-				HardwareHash:  e.hardwareHash(),
-				Backend:       e.Backend,
-				Vision:        e.Vision,
-				Round:         round,
-				Name:          suggestion.Name,
-				Flags:         flagMap(candidateFlags),
-				OverrideFlags: overrides,
-				Status:        "predicted-oom",
-			}
-			e.addCache(&crashed)
-			entries = append(entries, crashed)
-			crashedFlagSets = append(crashedFlagSets, overrides)
-			e.saveTuneProgress(modelPath, baseline, best, entries, minImprovementPct, false)
-			round++
-			continue
-		}
 
 		// Candidate flags need their own backend process; otherwise every round
 		// measures the same already-running baseline.
@@ -385,12 +356,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			if equalFlags(winnerFlags, candidateFlags) {
 				if e.OnProgress != nil {
 					e.OnProgress(fmt.Sprintf("auto-tune: refinement candidate %q made no effective flag changes", c.Name))
-				}
-				continue
-			}
-			if e.PredictOOM != nil && e.PredictOOM(candidateFlags) {
-				if e.OnProgress != nil {
-					e.OnProgress(fmt.Sprintf("auto-tune: skipping refinement candidate %q (predicted OOM)", c.Name))
 				}
 				continue
 			}

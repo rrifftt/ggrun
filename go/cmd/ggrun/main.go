@@ -1967,11 +1967,6 @@ func cmdTune(args []string) {
 		Model:            filepath.Base(req.ModelPath),
 		Rounds:           rounds,
 		RefinementRounds: 4,
-		PredictOOM: func(flags []string) bool {
-			fm := placement.ParseFlagsToMap(flags)
-			needed, free := placement.PredictVRAMUsage(model, fm, caps)
-			return needed > free
-		},
 		Cache:            cache,
 		Caps:             caps,
 		Backend:          be.Tag,
