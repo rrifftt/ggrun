@@ -91,14 +91,6 @@ func ManifestPath() string {
 	return filepath.Join(AppHome(), ".config", "backends.json")
 }
 
-func lockManifest() (*os.File, func(), error) {
-	lockPath := ManifestPath() + ".lock"
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
-		return nil, nil, err
-	}
-	return AcquireLock(lockPath)
-}
-
 // ponytail: global lock per-package; fine-grained per-field locks if throughput matters.
 var manifestMu sync.Mutex
 

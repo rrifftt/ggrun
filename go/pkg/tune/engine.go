@@ -173,8 +173,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 				continue
 			}
 			suggestion = &c
-			overrides = o
-			candidateFlags = f
 			break
 		}
 

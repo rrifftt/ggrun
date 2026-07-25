@@ -471,6 +471,9 @@ func TestSelectBackendExplicitServerBinWins(t *testing.T) {
 }
 
 func TestDetectBackendCUDAHelpMentionVulkanStaysLlama(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("macOS defaults to metal backend tag, not llama")
+	}
 	if runtime.GOOS == "windows" {
 		t.Skip("fake-backend probe uses a shell script")
 	}
