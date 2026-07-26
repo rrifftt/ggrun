@@ -45,8 +45,9 @@ func (r *Runner) Run() (*Result, error) {
 	warmUp := `Explain quantum computing in one sentence.`
 	measurePrompt := `Write a practical local LLM inference runbook for an engineer tuning llama.cpp serving. Cover request batching, KV cache size, GPU layer placement, split mode, speculative decoding, and output quality checks. Use numbered sections and continue until the runbook is complete.`
 
-	// Warm up: run 3 times to stabilize JIT/allocator state
-	for i := 0; i < 3; i++ {
+	// Single warm-up to stabilize CUDA graph capture and allocator state.
+	// llama.cpp has no JIT; the prefill request below serves as a second warm-up.
+	for i := 0; i < 1; i++ {
 		if _, err := r.chat(warmUp, 32); err != nil {
 			return nil, fmt.Errorf("warm-up: %w", err)
 		}

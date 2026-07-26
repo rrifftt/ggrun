@@ -1,8 +1,6 @@
 package tune
 
 import (
-
-	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -14,6 +12,11 @@ import (
 	"github.com/rrifftt/ggrun/pkg/detect"
 	"github.com/rrifftt/ggrun/pkg/placement"
 )
+
+// confirmationMarginThreshold is the minimum improvement percentage at which
+// the confirmation pass is skipped because the margin exceeds the noise floor.
+// Consumer GPU benchmark variance is typically ±2-3%; 15% is a conservative skip.
+const confirmationMarginThreshold = 15.0
 
 // Engine runs the AI-tune optimization loop.
 type Engine struct {
@@ -36,45 +39,11 @@ type Engine struct {
 	benchmarkFn func() (*benchmark.Result, error)
 }
 
-// Suggestion is the JSON format the tuning LLM returns.
+// Suggestion is a single flag-override candidate proposed by the deterministic tune plan.
 type Suggestion struct {
-	Name       string                 `json:"name"`
-	Flags      []string               `json:"-"`
-	FlagValues map[string]interface{} `json:"-"`
-	Reasoning  string                 `json:"reasoning"`
-}
-
-func (s *Suggestion) UnmarshalJSON(data []byte) error {
-	var raw struct {
-		Name      string          `json:"name"`
-		Flags     json.RawMessage `json:"flags"`
-		Reasoning string          `json:"reasoning"`
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return err
-	}
-	s.Name = raw.Name
-	s.Reasoning = raw.Reasoning
-	s.FlagValues = map[string]interface{}{}
-
-	if len(raw.Flags) == 0 || string(raw.Flags) == "null" {
-		return nil
-	}
-
-	var args []string
-	if err := json.Unmarshal(raw.Flags, &args); err == nil {
-		s.Flags = args
-		s.FlagValues = flagArgsToValues(args)
-		return nil
-	}
-
-	var values map[string]interface{}
-	if err := json.Unmarshal(raw.Flags, &values); err != nil {
-		return err
-	}
-	s.FlagValues = values
-	s.Flags = flagValuesToArgs(values)
-	return nil
+	Name       string
+	FlagValues map[string]interface{}
+	Flags      []string
 }
 
 // Run executes the full tune loop for a given model + initial strategy.
@@ -136,7 +105,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	crashedFlagSets := []map[string]interface{}{}
 
 	planIndex := 0
-	consecutiveWasted := 0 // tracks rounds that produced no useful candidate
 	for round := 1; round <= e.Rounds; {
 		if e.OnProgress != nil {
 			e.OnProgress(fmt.Sprintf("auto-tune: round %d/%d (best %.1f tok/s)", round, e.Rounds, best.Result.GenTPS))
@@ -177,11 +145,11 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 		}
 
 		if suggestion == nil {
-			suggestion = deterministicSuggestionFor(round, initialFlags, e.Backend, e.Caps, e.BackendHelp)
-		}
-		if suggestion == nil {
+			// Deterministic plan exhausted. No LLM fallback: the plan is
+			// comprehensive by design, and reloading the baseline to query
+			// an LLM that lacks the plan's context was the dominant runtime cost.
 			if e.OnProgress != nil {
-				e.OnProgress("auto-tune: no safe candidates left, stopping early")
+				e.OnProgress("auto-tune: deterministic plan exhausted, stopping")
 			}
 			break
 		}
@@ -192,26 +160,12 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			if e.OnProgress != nil {
 				e.OnProgress(fmt.Sprintf("auto-tune: candidate %q duplicates an earlier flag set", suggestion.Name))
 			}
-			consecutiveWasted++
-			if consecutiveWasted >= 3 {
-				if e.OnProgress != nil {
-					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
-				}
-				break
-			}
 			round++
 			continue
 		}
 		if isSkippedDueToOOM(overrides, crashedFlagSets, initialFlags) {
 			if e.OnProgress != nil {
 				e.OnProgress(fmt.Sprintf("auto-tune: skipping candidate %q due to predicted OOM", suggestion.Name))
-			}
-			consecutiveWasted++
-			if consecutiveWasted >= 3 {
-				if e.OnProgress != nil {
-					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
-				}
-				break
 			}
 			round++
 			continue
@@ -220,13 +174,6 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 		if equalFlags(initialFlags, candidateFlags) {
 			if e.OnProgress != nil {
 				e.OnProgress(fmt.Sprintf("auto-tune: candidate %q made no effective flag changes", suggestion.Name))
-			}
-			consecutiveWasted++
-			if consecutiveWasted >= 3 {
-				if e.OnProgress != nil {
-					e.OnProgress("auto-tune: 3 consecutive wasted rounds, stopping early")
-				}
-				break
 			}
 			round++
 			continue
@@ -302,13 +249,25 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 	// back to baseline, so AI-tune never caches — and the launcher never silently
 	// applies — a config that is slower than the default on every future launch.
 	if best != nil && baseline != nil && best != baseline && len(best.OverrideFlags) > 0 {
-		if e.OnProgress != nil {
-			e.OnProgress(fmt.Sprintf("auto-tune: confirming %s against baseline...", best.Name))
+		// Skip the 2-reload confirmation when the winner's margin far exceeds
+		// the measurement noise floor. The confirmation exists to filter
+		// noise-driven wins within ~5%; a 15%+ margin cannot be noise.
+		margin := 0.0
+		if baseline.Result.GenTPS > 0 {
+			margin = (best.Result.GenTPS - baseline.Result.GenTPS) / baseline.Result.GenTPS * 100.0
 		}
-		stopBaseline()
-		bestFlags := ApplyOverrides(initialFlags, best.OverrideFlags, protected)
-		confBase, errBase := e.round(e.Rounds+1, modelPath, initialFlags)
-		confBest, errBest := e.round(e.Rounds+2, modelPath, bestFlags)
+		if margin >= confirmationMarginThreshold {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("auto-tune: skipping confirmation (margin %.1f%% ≥ %.0f%% threshold)", margin, confirmationMarginThreshold))
+			}
+		} else {
+			if e.OnProgress != nil {
+				e.OnProgress(fmt.Sprintf("auto-tune: confirming %s against baseline...", best.Name))
+			}
+			stopBaseline()
+			bestFlags := ApplyOverrides(initialFlags, best.OverrideFlags, protected)
+			confBase, errBase := e.round(e.Rounds+1, modelPath, initialFlags)
+			confBest, errBest := e.round(e.Rounds+2, modelPath, bestFlags)
 		switch {
 		case errBase != nil || errBest != nil:
 			if e.OnProgress != nil {
@@ -332,6 +291,7 @@ func (e *Engine) Run(modelPath string, initialFlags []string) (*Entry, error) {
 			baseline.Best = true
 			best = baseline
 		}
+		} // end else (margin < threshold)
 	}
 
 	// =================================================================
@@ -785,15 +745,7 @@ func flagArgsToValues(args []string) map[string]interface{} {
 	return values
 }
 
-func deterministicSuggestionFor(round int, baseFlags []string, backend string, caps *detect.Capabilities, backendHelp string) *Suggestion {
-	candidates := deterministicPlan(baseFlags, backend, caps, backendHelp)
-	if len(candidates) == 0 {
-		return nil
-	}
-	c := candidates[(round-1)%len(candidates)]
-	c.Flags = flagValuesToArgs(c.FlagValues)
-	return &c
-}
+
 
 func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabilities, backendHelp string) []Suggestion {
     // Profile-aware candidate reordering
@@ -828,7 +780,6 @@ func deterministicPlan(baseFlags []string, backend string, caps *detect.Capabili
 			Name:       name,
 			FlagValues: values,
 			Flags:      flagValuesToArgs(values),
-			Reasoning:  reasoning,
 		})
 	}
 
@@ -1094,7 +1045,6 @@ func refinementPlan(baseFlags []string, backend string, caps *detect.Capabilitie
 			Name:       name,
 			FlagValues: values,
 			Flags:      flagValuesToArgs(values),
-			Reasoning:  reasoning,
 		})
 	}
 

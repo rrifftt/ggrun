@@ -35,8 +35,9 @@ type Config struct {
 	Backend       string `json:"backend"`
 	LlamaServer   string `json:"llama_server"`
 	AppHome       string `json:"app_home"`
-	TuneRounds    int    `json:"tune_rounds"`
-	Vision        bool   `json:"vision"`
+	TuneRounds       int    `json:"tune_rounds"`
+	RefinementRounds int    `json:"refinement_rounds"`
+	Vision           bool   `json:"vision"`
 	Parallel      int    `json:"parallel"`
 	Host          string `json:"host"`
 	Spec          string `json:"spec"` // off, auto, draft, eagle3, ngram, ngram-mod, ngram-k4v, mtp
@@ -54,7 +55,7 @@ var DefaultKeys = []string{
 	"RAM_BUDGET", "VRAM_HEADROOM", "RAM_HEADROOM", "KV_PLACEMENT", "KV_QUALITY",
 	"ASSUME_YES",
 	"BACKEND", "LLAMA_SERVER", "APP_HOME",
-	"TUNE_ROUNDS", "VISION", "PARALLEL", "HOST", "SPEC",
+	"TUNE_ROUNDS", "REFINEMENT_ROUNDS", "VISION", "PARALLEL", "HOST", "SPEC",
 }
 
 // Defaults returns the built-in defaults.
@@ -78,7 +79,8 @@ func Defaults() *Config {
 		Backend:       "",
 		LlamaServer:   "",
 		AppHome:       "",
-		TuneRounds:    8,
+		TuneRounds:       8,
+		RefinementRounds: 2,
 		Vision:        false,
 		Parallel:      1,
 		Host:          "127.0.0.1",
@@ -199,7 +201,7 @@ func snapshotEnv() map[string]string {
 		"LLM_HEALTH_TIMEOUT", "LLM_MODEL_DIR", "LLM_CACHE_DIR", "LLM_LOG_DIR",
 		"LLM_RAM_BUDGET", "LLM_VRAM_HEADROOM", "LLM_RAM_HEADROOM", "LLM_KV_PLACEMENT", "LLM_KV_QUALITY", "LLM_ASSUME_YES",
 		"LLM_BACKEND", "LLAMA_SERVER", "LLM_APP_HOME", "LLM_TUNE_ROUNDS",
-		"LLM_VISION", "LLM_PARALLEL", "LLM_HOST", "LLM_SPEC",
+		"LLM_VISION", "LLM_PARALLEL", "LLM_HOST", "LLM_SPEC", "LLM_REFINEMENT_ROUNDS",
 	} {
 		if v := os.Getenv(k); v != "" {
 			m[k] = v
@@ -317,6 +319,12 @@ func setConfigValue(cfg *Config, key, raw, source string) error {
 			return err
 		}
 		cfg.TuneRounds = n
+	case "REFINEMENT_ROUNDS":
+		n, err := parseNonNegativeInt(val)
+		if err != nil {
+			return err
+		}
+		cfg.RefinementRounds = n
 	case "VISION":
 		cfg.Vision = parseBool(val)
 	case "PARALLEL":
@@ -433,6 +441,7 @@ func (c *Config) Save() error {
 	}{
 		{"MAX_RESTARTS", c.MaxRestarts}, {"KEEP_ALIVE", c.KeepAlive},
 		{"HEALTH_TIMEOUT", c.HealthTimeout}, {"TUNE_ROUNDS", c.TuneRounds},
+		{"REFINEMENT_ROUNDS", c.RefinementRounds},
 		{"PARALLEL", c.Parallel},
 	} {
 		if numeric.val < 0 {
@@ -465,6 +474,7 @@ func (c *Config) Save() error {
 	fmt.Fprintf(&buf, "LLAMA_SERVER=%q\n", c.LlamaServer)
 	fmt.Fprintf(&buf, "LLM_APP_HOME=%q\n", c.AppHome)
 	fmt.Fprintf(&buf, "LLM_TUNE_ROUNDS=%d\n", c.TuneRounds)
+	fmt.Fprintf(&buf, "LLM_REFINEMENT_ROUNDS=%d\n", c.RefinementRounds)
 	fmt.Fprintf(&buf, "LLM_VISION=%v\n", c.Vision)
 	fmt.Fprintf(&buf, "LLM_PARALLEL=%d\n", c.Parallel)
 	fmt.Fprintf(&buf, "LLM_HOST=%q\n", c.Host)
@@ -516,6 +526,8 @@ func (c *Config) Show() string {
 			val = c.AppHome
 		case "TUNE_ROUNDS":
 			val = strconv.Itoa(c.TuneRounds)
+		case "REFINEMENT_ROUNDS":
+			val = strconv.Itoa(c.RefinementRounds)
 		case "VISION":
 			val = strconv.FormatBool(c.Vision)
 		case "PARALLEL":

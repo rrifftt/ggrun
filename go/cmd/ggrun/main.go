@@ -1966,7 +1966,7 @@ func cmdTune(args []string) {
 		BaseURL:          fmt.Sprintf("http://localhost:%d", req.Port),
 		Model:            filepath.Base(req.ModelPath),
 		Rounds:           rounds,
-		RefinementRounds: 4,
+		RefinementRounds: cfg.RefinementRounds,
 		Cache:            cache,
 		Caps:             caps,
 		Backend:          be.Tag,
