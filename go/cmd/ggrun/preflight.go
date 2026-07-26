@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rrifftt/ggrun/pkg/detect"
@@ -101,14 +102,31 @@ func preflightArgs(serverArgs []string) []string {
 	out := []string{"--fit-print", "on"}
 	for i := 0; i < len(serverArgs); i++ {
 		a := serverArgs[i]
-		if !preflightArgValueFlags[a] || i+1 >= len(serverArgs) {
+
+		// Handle --flag=value syntax
+		flagName := a
+		flagVal := ""
+		if eq := strings.Index(a, "="); eq > 0 {
+			flagName = a[:eq]
+			flagVal = a[eq+1:]
+		}
+
+		isMemoryFlag := preflightArgValueFlags[flagName]
+
+		// Case 1: --flag=value (single token)
+		if isMemoryFlag && flagVal != "" {
+			out = append(out, flagName, flagVal)
 			continue
 		}
-		// No legitimate value of these flags starts with "-"; a following flag
-		// means the user passed the flag bare — drop it rather than mis-pair.
-		if v := serverArgs[i+1]; !strings.HasPrefix(v, "-") {
-			out = append(out, a, v)
-			i++
+
+		// Case 2: --flag value (two tokens)
+		if isMemoryFlag && flagVal == "" && i+1 < len(serverArgs) {
+			// No legitimate value of these flags starts with "-"; a following flag
+			// means the user passed the flag bare — drop it rather than mis-pair.
+			if v := serverArgs[i+1]; !strings.HasPrefix(v, "-") {
+				out = append(out, flagName, v)
+				i++
+			}
 		}
 	}
 	return out
@@ -461,23 +479,29 @@ func preflightPlacement(be *backendInfo, cfg *configForPreflight, caps *detect.C
 // first-launch estimate. Best-effort: a failed candidate run just means that
 // rung stays on the heuristic, same as before this function existed.
 func measureUBatchLadderCandidates(fitBin string, serverArgs []string, cfg *configForPreflight, caps *detect.Capabilities, model *placement.ModelProfile, strategy *placement.Strategy, backendTag string) {
+	var wg sync.WaitGroup
 	for _, ub := range placement.UBatchFitLadder {
 		if ub >= strategy.UBatchSize {
 			continue
 		}
-		candArgs := replaceUBatchArg(serverArgs, ub)
-		devs, err := runFitPreflight(fitBin, candArgs)
-		if err != nil {
-			continue
-		}
-		computeByGPU := map[int]int{}
-		for _, d := range devs {
-			if idx, ok := cudaDeviceIndex(d.Name); ok {
-				computeByGPU[idx] = d.ComputeMB
+		wg.Add(1)
+		go func(ub int) {
+			defer wg.Done()
+			candArgs := replaceUBatchArg(serverArgs, ub)
+			devs, err := runFitPreflight(fitBin, candArgs)
+			if err != nil {
+				return
 			}
-		}
-		_ = placement.RecordMeasuredComputeBuffers(cfg.CacheDir, model, strategy.ContextSize, ub, strategy.KVQuality, strategy.KVPlacement, backendTag, caps.GPUs, strategy.Parallel, computeByGPU)
+			computeByGPU := map[int]int{}
+			for _, d := range devs {
+				if idx, ok := cudaDeviceIndex(d.Name); ok {
+					computeByGPU[idx] = d.ComputeMB
+				}
+			}
+			_ = placement.RecordMeasuredComputeBuffers(cfg.CacheDir, model, strategy.ContextSize, ub, strategy.KVQuality, strategy.KVPlacement, backendTag, caps.GPUs, strategy.Parallel, computeByGPU)
+		}(ub)
 	}
+	wg.Wait()
 }
 
 // replaceUBatchArg returns a copy of args with -ub/--ubatch-size's value set

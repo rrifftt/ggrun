@@ -235,11 +235,25 @@ func EstimateVRAMNeed(model *ModelProfile, ctxSize, ubatch int, kvTotalMB int, c
     for _, g := range caps.GPUs {
         totalFreeMB += g.VRAMFreeMB()
     }
-    cudaOverheadMB := measuredCUDAOverheadMB(loadSystemProbe(cacheDir, caps.GPUs))
+    numGPUs := len(caps.GPUs)
+    
+    // Sum measured per-GPU overhead, matching checkMemoryOrDie's logic
+    overheadByGPU := SystemCUDAOverheadByGPU(cacheDir, caps.GPUs)
+    totalCudaOverheadMB := 0
+    for _, v := range overheadByGPU {
+        totalCudaOverheadMB += v
+    }
+    // Fallback to measured aggregate if per-GPU isn't populated yet
+    if totalCudaOverheadMB == 0 {
+        totalCudaOverheadMB = measuredCUDAOverheadMB(loadSystemProbe(cacheDir, caps.GPUs))
+    }
+    
     computeBufMB := computeFloorMB
     if pc := loadProbeCache(cacheDir, model, ctxSize, ubatch, "mid", "auto", "", caps.GPUs, 1); pc != nil {
         computeBufMB = pc.ComputeBufMB
     }
-    neededMB = model.TotalSizeMB + cudaOverheadMB + computeBufMB + kvTotalMB
+    
+    // Charge compute buffer per active GPU, matching checkMemoryOrDie
+    neededMB = model.TotalSizeMB + totalCudaOverheadMB + (computeBufMB * numGPUs) + kvTotalMB
     return neededMB, totalFreeMB
 }

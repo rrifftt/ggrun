@@ -49,9 +49,10 @@ func TestResolveAutoKVPlacement(t *testing.T) {
 		{"small_moe_fits_gpu", 8000, 4000, true, "qwen3moe", "gpu"},
 		{"small_moe_huge_kv_offloads_cpu", 8000, 50000, true, "qwen3moe", "cpu"},
 		// deepseek4 without flash attention grows compute scratch with real
-		// token position (~98 KiB/token measured) — KV must stay on GPU so FA
-		// stays enabled, even for a big offloading MoE.
-		{"deepseek4_big_moe_keeps_kv_gpu", 140000, 16000, true, "deepseek4", "gpu"},
+		// token position (~98 KiB/token measured) — KV stays on GPU only if
+		// it actually fits; otherwise falls back to CPU.
+		{"deepseek4_small_fits_gpu", 20000, 4000, true, "deepseek4", "gpu"},
+		{"deepseek4_big_moe_keeps_kv_gpu", 140000, 16000, true, "deepseek4", "cpu"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

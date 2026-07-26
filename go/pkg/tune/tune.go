@@ -103,8 +103,8 @@ func (c *Cache) Save(entries []Entry) error {
 	return c.writeEntries(entries)
 }
 
-// FindBest returns the best entry for given model + hardware hash.
-func (c *Cache) FindBest(modelPath, hwHash string) (*Entry, error) {
+// FindBest returns the best entry for given model + hardware hash + backend + vision.
+func (c *Cache) FindBest(modelPath, hwHash, backend string, vision bool) (*Entry, error) {
 	entries, err := c.Load()
 	if err != nil {
 		return nil, err
@@ -112,7 +112,7 @@ func (c *Cache) FindBest(modelPath, hwHash string) (*Entry, error) {
 	var best *Entry
 	for i := range entries {
 		e := &entries[i]
-		if e.ModelPath == modelPath && e.HardwareHash == hwHash && e.Best {
+		if e.ModelPath == modelPath && e.HardwareHash == hwHash && e.Backend == backend && e.Vision == vision && e.Best {
 			if best == nil || e.Result.GenTPS > best.Result.GenTPS {
 				best = e
 			}

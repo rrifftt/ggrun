@@ -524,12 +524,17 @@ func buildMoEOffload(s *Strategy, caps *detect.Capabilities, model *ModelProfile
 			nonExpertMB = totalSizeMB / 10
 		}
 		computeMB := firstLaunchComputeBufMB(model, s.UBatchSize)
-		cudaMB := cudaOverheadFallbackMB // conservative per-GPU CUDA context overhead
+		totalCudaOverheadMB := 0
+		for _, overhead := range sysCUDAOverheadByGPU {
+			totalCudaOverheadMB += overhead
+		}
+		// checkMemoryOrDie charges compute buffer per active GPU.
+		totalComputeMB := computeMB * numGPUs
 		freeVRAM := 0
 		for _, g := range caps.GPUs {
 			freeVRAM += g.VRAMFreeMB()
 		}
-		gpuBudgetMB := freeVRAM - nonExpertMB - kvTotalMB - computeMB - cudaMB
+		gpuBudgetMB := freeVRAM - nonExpertMB - kvTotalMB - totalComputeMB - totalCudaOverheadMB
 		gpuBudgetMB = gpuBudgetMB * 90 / 100 // 10% safety margin
 		if gpuBudgetMB > 0 && expertPerLayerMB > 0 {
 			maxGPUExperts := gpuBudgetMB / expertPerLayerMB

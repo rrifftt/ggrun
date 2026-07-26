@@ -231,7 +231,10 @@ func parseVulkanHeapVRAM(full string) map[string]int {
 		case strings.Contains(line, "DEVICE_LOCAL"):
 			if curName != "" && heapHasSize && heapBytes > 0 &&
 				!strings.Contains(strings.ToUpper(curType), "INTEGRATED") {
-				if mb := int(heapBytes / (1024 * 1024)); mb > result[curName] {
+				mb := int(heapBytes / (1024 * 1024))
+				// Take the smallest non-zero DEVICE_LOCAL heap.
+				// ReBAR can expose a large system-RAM-backed heap as DEVICE_LOCAL.
+				if mb > 0 && (result[curName] == 0 || mb < result[curName]) {
 					result[curName] = mb
 				}
 			}

@@ -139,7 +139,13 @@ func resolveAutoKVPlacement(caps *detect.Capabilities, model *ModelProfile, tota
 			// KV on CPU makes llama.cpp auto-disable flash attention, and
 			// deepseek4's non-FA graph materializes score tensors that grow
 			// with real token position — no load-time reserve can cover that.
-			return "gpu"
+			// Only force GPU KV if it actually fits; otherwise fall back to CPU
+			// rather than failing placement entirely.
+			if totalSizeMB+kvTotalMB+vramOverheadMB <= freeVRAM {
+				return "gpu"
+			}
+			fmt.Fprintf(os.Stderr, "[placement] deepseek4 KV does not fit on GPU; falling back to CPU (flash attention disabled, expect instability at long contexts)\n")
+			return "cpu"
 		}
 		// After expert offload, only non-expert weights occupy VRAM.
 		// If non-expert + KV + overhead fits, keep KV on GPU for decode speed.
@@ -219,7 +225,7 @@ func computeAutoContextSizeKVPlacement(caps *detect.Capabilities, model *ModelPr
 			maxCtx = model.CTXTrain
 		}
 		best := 0
-		for _, c := range []int{32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304} {
+		for _, c := range []int{32768, 49152, 65536, 98304, 131072, 196608, 262144, 393216, 524288, 786432, 1048576, 2097152, 4194304} {
 			if c <= maxCtx {
 				best = c
 			}

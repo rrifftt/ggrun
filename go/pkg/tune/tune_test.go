@@ -62,7 +62,7 @@ func TestCache(t *testing.T) {
 		t.Fatalf("add: %v", err)
 	}
 
-	best, err := c.FindBest("/models/test.gguf", "abc123")
+	best, err := c.FindBest("/models/test.gguf", "abc123", "", false)
 	if err != nil {
 		t.Fatalf("find best: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestCacheKeepsFasterBest(t *testing.T) {
 		t.Fatalf("add slow: %v", err)
 	}
 
-	best, err := c.FindBest("/models/test.gguf", "abc123")
+	best, err := c.FindBest("/models/test.gguf", "abc123", "", false)
 	if err != nil {
 		t.Fatalf("find best: %v", err)
 	}

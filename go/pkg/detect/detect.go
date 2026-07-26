@@ -196,7 +196,7 @@ func settleGPUFreeVRAM(ctx context.Context, gpus []GPU) {
 		if cur == nil {
 			return // nvidia-smi unavailable this round; keep the original reading
 		}
-		if applySettleRound(gpus, prev, cur, settleStableThresholdMB) {
+		if applySettleRound(gpus, prev, cur, settleThreshold(gpus)) {
 			return
 		}
 	}
@@ -204,13 +204,28 @@ func settleGPUFreeVRAM(ctx context.Context, gpus []GPU) {
 
 const settleStableThresholdMB = 64
 
+// settleThreshold returns the VRAM delta threshold for stability checks.
+// Data center GPUs (A100/H100 80GB) can reclaim hundreds of MB during teardown,
+// so we scale the threshold to ~0.5% of total VRAM (capped at 64MB for consumer cards).
+func settleThreshold(gpus []GPU) int {
+	if len(gpus) == 0 {
+		return settleStableThresholdMB
+	}
+	total := gpus[0].VRAMTotalMB
+	if total > 32768 {
+		return total / 200 // ~0.5% (e.g., 400MB for 80GB)
+	}
+	return settleStableThresholdMB
+}
+
 // anyMeaningfulUsage reports whether any GPU shows non-trivial VRAM use. An
 // idle machine (all near zero) can never be mid-teardown, so it skips the
 // settle delay entirely — the race only matters when there's real reported
 // usage that might actually be stale.
 func anyMeaningfulUsage(gpus []GPU) bool {
+	threshold := settleThreshold(gpus)
 	for _, g := range gpus {
-		if g.VRAMUsedMB > settleStableThresholdMB {
+		if g.VRAMUsedMB > threshold {
 			return true
 		}
 	}

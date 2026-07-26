@@ -31,6 +31,7 @@ type SpecProfileScope struct {
 	Parallel          int    `json:"parallel"`
 	SamplingProfile   string `json:"sampling_profile"`
 	ReasoningOff      bool   `json:"reasoning_off"`
+	KVType            string `json:"kv_type"`
 }
 
 type SpecPerformanceProfile struct {
@@ -163,7 +164,7 @@ func NewSpecProfileScope(target *ModelProfile, caps *detect.Capabilities, opts O
 	return SpecProfileScope{
 		TargetIdentity: SpecTargetIdentity(target), CompanionIdentity: SpecCompanionIdentity(companionPath),
 		BackendIdentity: backend, HardwareIdentity: SpecHardwareIdentity(caps), GPUSet: specGPUSet(opts.GPUs), Kind: kind,
-		ContextSize: ctx, Parallel: parallel, SamplingProfile: sampling, ReasoningOff: opts.ReasoningOff,
+		ContextSize: ctx, Parallel: parallel, SamplingProfile: sampling, ReasoningOff: opts.ReasoningOff, KVType: opts.KVQuality,
 	}
 }
 
