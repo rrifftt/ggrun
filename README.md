@@ -44,7 +44,7 @@ CGO_ENABLED=0 go build -o ggrun ./cmd/ggrun/
 ```bash
 ./ggrun detect                          # detect hardware
 ./ggrun dry-run model.gguf --ctx 65536  # preview flags without launching
-./ggrun tune model.gguf --rounds 30 --ctx 65536 --server-bin PATH_TO_LLAMA_SERVER      # auto-tune (~5 min)
+./ggrun tune model.gguf --rounds 30 --ctx 65536 --server-bin PATH_TO_LLAMA_SERVER   # auto-tune
 ./ggrun model.gguf --ctx 65536          # launch with cached tune
 ./ggrun model.gguf --gpus 0,2           # multi-GPU
 ```
