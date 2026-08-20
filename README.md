@@ -1,6 +1,6 @@
 # ggrun
 
-auto-tuned llama.cpp launcher with automatic GPU/CPU placement, MoE expert offload, and hardware-aware KV cache management. Point it at a GGUF model and it figures out the optimal `llama-server` flags for your exact hardware.
+auto-tuned llama.cpp server parameter finder with automatic GPU/CPU placement, MoE expert offload, and hardware-aware KV cache management. Point it at a GGUF model and it figures out the optimal `llama-server` flags for your exact hardware.
 
 ## Results
 
@@ -46,7 +46,6 @@ CGO_ENABLED=0 go build -o ggrun ./cmd/ggrun/
 ./ggrun dry-run model.gguf --ctx 65536  # preview flags without launching
 ./ggrun tune model.gguf --rounds 30 --ctx 65536 --server-bin PATH_TO_LLAMA_SERVER   # auto-tune
 ./ggrun tune model.gguf --retune --rounds 30 --ctx 65536 --server-bin PATH_TO_LLAMA_SERVER  # re-tune
-./ggrun model.gguf --ctx 65536          # launch with cached tune
 ./ggrun model.gguf --gpus 0,2           # multi-GPU
 ```
 
